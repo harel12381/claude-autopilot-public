@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Fetch and push for the worktrees of one repository. They share one .git folder, so they share
+# the remote refs (refs/remotes/origin/*).
+#
+#   ap-git-sync fetch [args]     # git fetch origin [args], one worktree at a time
+#   ap-git-sync pull             # fetch, then move this branch forward to its upstream (--ff-only)
+#   ap-git-sync push             # push this branch to origin/<the same name>; fails unless it arrived
+#   ap-git-sync pushed           # exit 0 only when origin/<this branch> on the remote is HEAD
+#   ap-git-sync new-branch <b>   # fetch, then a new branch <b> from origin/<main>, in a clean tree
+#   ap-git-sync -C <dir> ...     # the same, in that worktree (as git -C)
+#
+# Why:
+#   - Two `git fetch` at the same time in two worktrees: the second one fails with "incorrect old
+#     value provided". Git reads every remote ref, downloads, then writes the refs in one step that
+#     checks each ref still has the value it read. Another fetch may have changed them meanwhile.
+#     So fetch, pull and push take a lock in the shared .git folder (ap-git.lock), one at a time.
+#   - A failed push can look like one that worked: `git push -q 2>&1 | tail -1` keeps only the
+#     last line and the exit code of tail, and a merge then takes the commit before. So push prints
+#     all of git's words, and asks the remote whether the branch is HEAD now. Merge with
+#     `gh pr merge --match-head-commit "$(git rev-parse HEAD)"`.
+#   - `git switch -c x origin/main` makes origin/main the upstream of x, and a plain `git push`
+#     then refuses (the names differ). push always sends HEAD to origin/<branch>.
+#   - push never sends the project's main branch (main_branch in .claude/ap.json), main or master:
+#     work reaches them only through a pull request.
+#   - new-branch is how a helper starts its work in a worktree that an earlier helper used: it
+#     refuses when a file is not committed (the earlier helper's work), then fetches, runs
+#     `git switch -c <b> origin/<main>`, and `git clean -fd` without -x: the files the old branch
+#     left that git does not know go, the ignored build caches stay. The local files under .claude/
+#     are left out of both the check and the clean.
+set -uo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/dirlock.sh
+source "$LIB/dirlock.sh" || exit 2
+# shellcheck source=plugins/ap/lib/config.sh
+source "$LIB/config.sh" || exit 2
+
+usage() {
+  echo "usage: ap-git-sync [-C <dir>] fetch [args] | pull | push | pushed | new-branch <branch>" >&2
+  exit 2
+}
+if [ "${1:-}" = -C ]; then
+  [ $# -ge 2 ] || usage
+  cd "$2" || exit 1
+  shift 2
+fi
+
+COMMON=$(git rev-parse --path-format=absolute --git-common-dir) || exit 1
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+LOCK="$COMMON/ap-git.lock"
+STUCK=${AP_GIT_STUCK_SECONDS:-600} # a lock this old belongs to a git that hangs: it is taken over
+
+# The lock (lib/dirlock.sh). Its words go to stderr.
+lock() {
+  dirlock_take "$LOCK" "$ROOT (since $(date +%H:%M:%S)) $1" "$STUCK" 0.2 "ap-git-sync: waiting for the git" >&2
+}
+trap 'dirlock_free "$LOCK"' EXIT
+
+branch() {
+  git symbolic-ref -q --short HEAD || { echo "ap-git-sync: HEAD is not on a branch" >&2; return 1; }
+}
+pushed() { # branch: 0 when the branch on origin is HEAD
+  local here there
+  here=$(git rev-parse HEAD) || return 1
+  # A network error here says nothing about the push itself: a push can arrive and this call
+  # still get "Connection was reset", so it must not say "git push failed".
+  there=$(git ls-remote origin "refs/heads/$1" | cut -f1) || {
+    echo "ap-git-sync: could not ask origin whether $1 is HEAD (its words are above). Ask again: ap-git-sync pushed" >&2
+    return 1
+  }
+  [ "$here" = "$there" ] && return 0
+  echo "ap-git-sync: origin/$1 is ${there:-missing}, HEAD is $here: the push did not arrive" >&2
+  return 1
+}
+
+cmd=${1:-}; shift || true
+case $cmd in
+  fetch)
+    lock fetch; git fetch origin "$@" ;;
+  pull)
+    [ $# = 0 ] || usage
+    lock pull; git fetch origin && git merge --ff-only '@{upstream}' ;;
+  push)
+    [ $# = 0 ] || usage
+    b=$(branch) || exit 1
+    # Read before the lock: a broken .claude/ap.json stops the push, never lets it through.
+    main=$(ap_config main_branch "") || { echo "ap-git-sync: not pushed: .claude/ap.json cannot be read" >&2; exit 1; }
+    case $b in
+      main | master | "$main")
+        echo "ap-git-sync: never push $b, a main branch: push a topic branch and open a pull request" >&2
+        exit 1 ;;
+    esac
+    lock push
+    # The remote's branch is what counts: git push can fail after the branch arrived (the local
+    # copy of origin/<branch> could not be written), and a push can say little when it did not.
+    git push -u origin "$b"; rc=$?
+    pushed "$b" || { [ $rc = 0 ] || echo "ap-git-sync: git push failed (exit $rc; its words are above)" >&2; exit 1; }
+    [ $rc = 0 ] || echo "ap-git-sync: git push said exit $rc, but origin/$b is HEAD" >&2
+    echo "ap-git-sync: origin/$b is HEAD ($(git rev-parse --short HEAD))" ;;
+  new-branch)
+    [ $# = 1 ] && [ -n "$1" ] || usage
+    main=$(ap_config main_branch) || { echo "ap-git-sync: .claude/ap.json has no main_branch" >&2; exit 1; }
+    left=$(git status --porcelain -- . ':!.claude') || exit 1
+    if [ -n "$left" ]; then
+      echo "ap-git-sync: the tree is not clean, so no new branch (commit and push it first):" >&2
+      head -5 <<<"$left" >&2
+      exit 1
+    fi
+    { lock new-branch && git fetch origin; } || exit 1
+    dirlock_free "$LOCK"
+    git switch -c "$1" "origin/$main" && git clean -fd -- . ':!.claude' ;;
+  pushed)
+    [ $# = 0 ] || usage
+    b=$(branch) || exit 1
+    pushed "$b" && echo "ap-git-sync: origin/$b is HEAD ($(git rev-parse --short HEAD))" ;;
+  *)
+    usage ;;
+esac

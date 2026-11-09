@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Runs the project's check on a branch from origin, in a folder of its own, so the main checkout
+# stays on its branch. The manager runs it on every approved pull request before its merge turn.
+#
+#   ap-git-sync fetch && ap-check-branch <branch>
+#
+# The folder is the worktree <main checkout>/.claude/worktrees/check-<branch> (a `/` becomes
+# `-`), detached at origin/<branch>. A folder of that name that is still there (a check that a
+# stop or a closed session cut off) is removed first. In the folder it runs hooks.check_setup
+# when it is set (what a fresh checkout needs before the check, such as installing packages),
+# then `check`, both from the branch's own .claude/ap.json (the main checkout's when the branch
+# has none), so a branch that changes its check is checked with the new one. The folder is removed at the end, also when the check
+# fails or the script is stopped.
+#
+# Before a left folder is deleted, the build and test tools that still run in it are stopped
+# (lib/check-tree.sh), as `ap-run end` does; a folder that still cannot be deleted (on Windows, a
+# file another program holds) is named, and the check does not run.
+#
+# The last line says what happened. Exit: the check's own code, or one of these two, kept out of
+# the range checks use:
+#   90  the check could not run: no `check` set, the settings cannot be read, no origin/<branch>,
+#       the worktree could not be made, or a left folder could not be deleted;
+#   91  hooks.check_setup failed, so the check did not run.
+set -euo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/hooks.sh
+source "$LIB/hooks.sh" # ap_main, ap_config, hook_cmd, hook_run
+# shellcheck source=plugins/ap/lib/proc-tree.sh
+source "$LIB/proc-tree.sh" # stop_folder_users
+# shellcheck source=plugins/ap/lib/check-tree.sh
+source "$LIB/check-tree.sh" # check_tree_make, check_tree_remove, check_tree_run
+CANT=90 SETUP_FAILED=91
+
+say() { echo "ap-check-branch: $*"; }
+die() { echo "ap-check-branch: $*" >&2; exit $CANT; }
+[ $# = 1 ] && [ -n "$1" ] || {
+  echo "usage: ap-check-branch <branch>   (exit: the check's code; $CANT: could not run; $SETUP_FAILED: hooks.check_setup failed)" >&2
+  exit $CANT
+}
+branch=$1
+MAIN=$(ap_main) || exit $CANT
+git -C "$MAIN" rev-parse -q --verify "refs/remotes/origin/$branch^{commit}" >/dev/null ||
+  die "no origin/$branch (run ap-git-sync fetch first)"
+
+wt=$MAIN/.claude/worktrees/check-${branch//\//-}
+check_tree_make "$MAIN" "$wt" "origin/$branch" || exit $CANT
+trap 'check_tree_remove "$MAIN" "$wt" || true' EXIT
+trap 'exit 143' INT TERM HUP
+rc=0; check=$(ap_config_at "$wt" check) || rc=$?
+[ $rc = 0 ] || { [ $rc = 2 ] && exit $CANT; die "no check set in .claude/ap.json"; }
+setup=$(hook_cmd check_setup "$wt") || exit $CANT
+
+rc=0; AP_CHECK_KIND=fresh check_tree_run "$wt" "$setup" "$check" "$branch" || rc=$?
+if [ $rc = 0 ]; then say "$branch: the check passed"
+elif [ "$CHECK_TREE_SETUP_FAILED" = 0 ]; then say "$branch: the check failed (exit $rc)"
+fi
+exit $rc

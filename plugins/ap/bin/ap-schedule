@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# Runs on a schedule: the computer's own scheduler (Task Scheduler on Windows, cron elsewhere)
+# starts a background Claude Code session in the main checkout at a set time, and that session
+# runs `/ap:schedule fire <name>`, which starts `/ap:run` with the schedule's arguments.
+#
+#   ap-schedule add <name> --at <HH:MM> [--days mon,tue,...] -- <run arguments>
+#   ap-schedule list                # the schedules of this repository, with their entry and last start
+#   ap-schedule remove <name>       # the schedule and its entry in the computer's scheduler
+#   ap-schedule now <name>          # starts it at once, as the scheduler would (to try it)
+#   ap-schedule fire <name>         # in the scheduled session: starts the run (ap-run start --alone)
+#                                   # and prints `run <id>`, then the run arguments, exit 0; exit 3
+#                                   # when another run goes on (its ids on stdout), and no run starts
+#
+# <name>: small letters, digits and `-`. --days: mon tue wed thu fri sat sun (default: every day).
+# The session starts as `claude --bg --permission-mode bypassPermissions`: nobody is there to
+# answer a prompt. Its first words go to <name>.log.
+#
+# The files are in <.git>/ap-schedule/ (this computer only, like the scheduler's entries):
+# <name>.conf (line 1: the time and days, line 2: the run arguments), <name>.sh (what the
+# scheduler runs), <name>.log. The scheduler's entry is named ap-<checkout folder>-<hash>-<name>
+# (the hash: of the main checkout's path, so two checkouts with one folder name never share one).
+# On Windows, a new task may also start and go on while the computer runs on battery
+# (Set-ScheduledTask through PowerShell; schtasks itself has no option for it). When PowerShell
+# cannot set it, add says so: the owner unticks it in Task Scheduler.
+# AP_SCHEDULE_SYSTEM (schtasks or cron) picks the scheduler; default: schtasks when it is there.
+# Exit 0: done; 1: no such schedule, or the scheduler refused; 2: wrong use; 3: another run goes on.
+set -euo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/run-dir.sh
+source "$LIB/run-dir.sh" # COMMON, MAIN
+
+usage() {
+  echo "usage: ap-schedule add <name> --at <HH:MM> [--days mon,tue,...] -- <run arguments>" \
+    "| list | remove <name> | now <name> | fire <name>" >&2
+  exit 2
+}
+SCHED=$COMMON/ap-schedule
+mkdir -p "$SCHED"
+SYSTEM=${AP_SCHEDULE_SYSTEM:-$(command -v schtasks >/dev/null 2>&1 && echo schtasks || echo cron)}
+DAYS=(sun mon tue wed thu fri sat) # cron's numbers: 0 is Sunday
+
+valid_name() { [[ ${1:-} =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]] || { echo "ap-schedule: a name is small letters, digits and -: ${1:-}" >&2; exit 2; }; }
+known() { [ -f "$SCHED/$1.conf" ] || { echo "ap-schedule: no schedule $1 (ap-schedule list)" >&2; exit 1; }; }
+entry() { # name: the scheduler's name for it
+  local base=${MAIN##*/}
+  printf 'ap-%s-%s-%s' "$(tr -c 'A-Za-z0-9-' - <<<"$base" | sed 's/-$//')" "$(git hash-object --stdin <<<"$MAIN" | cut -c1-6)" "$1"
+}
+win() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi; } # path
+schtasks_run() { MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' schtasks "$@"; } # no /Create -> C:/Create
+
+cron_line() { # name, HH:MM, days: the crontab line
+  local h=${2%%:*} m=${2##*:} dow='*' d i nums=()
+  if [ -n "$3" ]; then
+    for d in ${3//,/ }; do for i in "${!DAYS[@]}"; do [ "${DAYS[$i]}" = "$d" ] && nums+=("$i"); done; done
+    dow=$(IFS=,; echo "${nums[*]}")
+  fi
+  printf '%d %d * * %s bash -l %q # %s\n' "$((10#$m))" "$((10#$h))" "$dow" "$SCHED/$1.sh" "$(entry "$1")"
+}
+cron_without() { crontab -l 2>/dev/null | grep -vF "# $(entry "$1")" || true; } # name: the crontab without its line
+cron_set() { # lines: the whole crontab (read before it is written: crontab -l and - in one pipe race)
+  if [ -n "$1" ]; then printf '%s\n' "$1" | crontab -; else crontab -r 2>/dev/null || true; fi
+}
+
+add_entry() { # name, HH:MM, days
+  local tr
+  if [ "$SYSTEM" = schtasks ]; then
+    tr="\"$(win "$(command -v bash)")\" -l \"$(win "$SCHED/$1.sh")\""
+    if [ -n "$3" ]; then
+      schtasks_run /Create /F /TN "$(entry "$1")" /SC WEEKLY /D "$(tr a-z A-Z <<<"$3")" /ST "$2" /TR "$tr"
+    else
+      schtasks_run /Create /F /TN "$(entry "$1")" /SC DAILY /ST "$2" /TR "$tr"
+    fi
+  else
+    cron_set "$(cron_without "$1"; cron_line "$@")"
+  fi
+}
+on_battery() { # name: the Windows task may start, and go on, on battery power
+  local ps
+  ps=$(command -v powershell || command -v powershell.exe) || return 1
+  "$ps" -NoProfile -NonInteractive -Command "Set-ScheduledTask -TaskName '$(entry "$1")' -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries) | Out-Null"
+}
+remove_entry() { # name
+  if [ "$SYSTEM" = schtasks ]; then
+    schtasks_run /Query /TN "$(entry "$1")" >/dev/null 2>&1 || return 0
+    schtasks_run /Delete /F /TN "$(entry "$1")"
+  else
+    cron_set "$(cron_without "$1")"
+  fi
+}
+has_entry() { # name
+  if [ "$SYSTEM" = schtasks ]; then schtasks_run /Query /TN "$(entry "$1")" >/dev/null 2>&1
+  else crontab -l 2>/dev/null | grep -qF "# $(entry "$1")"
+  fi
+}
+
+case ${1:-} in
+  add)
+    [ $# -ge 2 ] || usage
+    name=$2 at= days=
+    valid_name "$name"
+    shift 2
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do
+      case $1 in
+        --at) [[ ${2:-} =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || usage; at=$2; shift 2 ;;
+        --days) [[ ${2:-} =~ ^(sun|mon|tue|wed|thu|fri|sat)(,(sun|mon|tue|wed|thu|fri|sat))*$ ]] || usage; days=$2; shift 2 ;;
+        *) usage ;;
+      esac
+    done
+    [ -n "$at" ] && [ "${1:-}" = -- ] || usage
+    shift
+    args="$*"
+    [[ $args != *$'\n'* ]] || usage
+    claude=$(command -v claude) || { echo "ap-schedule: claude is not on the PATH: the scheduler could not start it" >&2; exit 1; }
+    printf '%s %s\n%s\n' "$at" "${days:-daily}" "$args" >"$SCHED/$name.conf"
+    {
+      echo '#!/usr/bin/env bash'
+      echo "# Started by the computer's scheduler for the ap schedule \"$name\" (ap-schedule add)."
+      printf 'cd %q || exit 2\n' "$MAIN"
+      printf 'echo "$(date "+%%F %%T") ap-schedule: started" >>%q\n' "$SCHED/$name.log"
+      printf 'exec %q --bg --permission-mode bypassPermissions -n %q %q >>%q 2>&1\n' \
+        "$claude" "ap: $name" "/ap:schedule fire $name" "$SCHED/$name.log"
+    } >"$SCHED/$name.sh"
+    chmod +x "$SCHED/$name.sh"
+    add_entry "$name" "$at" "$days" >/dev/null ||
+      { echo "ap-schedule: $SYSTEM did not take the entry $(entry "$name")" >&2; exit 1; }
+    if [ "$SYSTEM" = schtasks ] && ! on_battery "$name" >/dev/null 2>&1; then
+      echo "ap-schedule: could not let the task run on battery: in Task Scheduler, the task $(entry "$name")," \
+        "Conditions, untick \"Start the task only if the computer is on AC power\""
+    fi
+    echo "schedule $name: ${days:-every day} at $at, /ap:run $args ($SYSTEM: $(entry "$name"))" ;;
+  list)
+    [ $# = 1 ] || usage
+    found=0
+    for f in "$SCHED"/*.conf; do
+      [ -f "$f" ] || continue
+      found=1 name=${f##*/} name=${name%.conf}
+      { read -r when; read -r args || true; } <"$f"
+      there=missing; has_entry "$name" && there=set
+      last=$(grep -E ' ap-schedule: started$' "$SCHED/$name.log" 2>/dev/null | tail -1 | sed 's/ ap-schedule: started$//' || true)
+      printf '%s\t%s\t/ap:run %s\tentry %s\tlast start %s\n' "$name" "$when" "$args" "$there" "${last:-never}"
+    done
+    [ $found = 1 ] || echo "no schedules" ;;
+  remove)
+    [ $# = 2 ] || usage
+    valid_name "$2"; known "$2"
+    remove_entry "$2" >/dev/null || { echo "ap-schedule: $SYSTEM did not remove $(entry "$2")" >&2; exit 1; }
+    rm -f "$SCHED/$2.conf" "$SCHED/$2.sh"
+    echo "removed the schedule $2 (its log stays: $SCHED/$2.log)" ;;
+  now)
+    [ $# = 2 ] || usage
+    valid_name "$2"; known "$2"
+    bash "$SCHED/$2.sh"
+    echo "started $2: the session's first words are in $SCHED/$2.log (claude agents lists it)" ;;
+  fire)
+    [ $# = 2 ] || usage
+    valid_name "$2"; known "$2"
+    rc=0; run=$(ap-run start --alone) || rc=$?
+    if [ $rc = 3 ]; then
+      others=$(paste -sd' ' - <<<"$run")
+      echo "$(date '+%F %T') ap-schedule: not started: another run goes on ($others)" >>"$SCHED/$2.log"
+      echo "$others"
+      exit 3
+    fi
+    [ $rc = 0 ] || exit "$rc"
+    echo "$(date '+%F %T') ap-schedule: run $run" >>"$SCHED/$2.log"
+    echo "run $run"
+    sed -n 2p "$SCHED/$2.conf" ;;
+  *) usage ;;
+esac

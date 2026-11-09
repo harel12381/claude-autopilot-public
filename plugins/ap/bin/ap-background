@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Runs a long command as an agent's background task, so that stopping the task stops everything
+# the command started.
+#
+#   ap-background npm run dev
+#   ap-background python -m http.server 8000
+#
+# An agent stops a background task by killing the shell the task runs in. On Windows that ends
+# only that Git Bash shell: the native programs under it keep running (a dev server keeps its
+# compiler and its port). This script watches the shell that started it, every
+# AP_BACKGROUND_WATCH_S seconds (5). When that shell is gone, it stops the command with every
+# process under it (lib/proc-tree.sh). It does the same when it is stopped itself (TERM, INT,
+# HUP). Otherwise it ends with the command, with its exit code.
+set -uo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/proc-tree.sh
+source "$LIB/proc-tree.sh" || exit 2
+
+[ $# -gt 0 ] || { echo "usage: ap-background <command> [args...]" >&2; exit 2; }
+SHELL_PID=$PPID # the shell the agent's task runs in
+EVERY=${AP_BACKGROUND_WATCH_S:-5}
+
+CMD= WATCH=
+stopped() { # exit code: stops the command (unless it ended) and the watcher
+  [ -z "$CMD" ] || stop_tree "$CMD"
+  [ -z "$WATCH" ] || kill "$WATCH" 2>/dev/null
+  exit "$1"
+}
+trap 'stopped 143' TERM; trap 'stopped 130' INT; trap 'stopped 129' HUP
+# The command keeps this script's input (a background command would get /dev/null).
+"$@" <&0 &
+CMD=$!
+if [ "$SHELL_PID" -gt 1 ]; then
+  (
+    trap - TERM INT HUP # stopped by the script when the command ended: it must stop nothing then
+    trap '' PIPE # the task's output may be gone with its shell: never die on the word below
+    wait_shell_gone "$SHELL_PID" "$CMD" "$EVERY" || exit 0
+    echo "ap-background: the shell that started it is gone: stopping $1 and all it started" >&2
+    stop_tree "$CMD"
+  ) </dev/null &
+  WATCH=$!
+else
+  echo "ap-background: started by a Windows program (no shell to watch): stopping that will not stop $1" >&2
+fi
+wait "$CMD"
+rc=$?
+CMD=
+stopped $rc

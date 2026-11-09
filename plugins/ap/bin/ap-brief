@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Makes the brief of one agent of /ap:run and prints the file's path: the plugin's brief, the
+# project's own part (briefs.<name> of .claude/ap.json), and every <WORD> that CONTRACT.md
+# names ("The briefs") filled in. The manager starts the agent with a short prompt
+# that names the file, so the long brief never fills the manager's own context.
+#
+#   ap-brief helper   --run 11 --n "47" [--slot 1] [--worktree ap-1b] [--note "<a limit>"]
+#   ap-brief reviewer --run 11 --n "47" --pr 52
+#   ap-brief planner  --run 11 --n "47 52 60"      # the run's whole list, in its order
+#   ap-brief retro    --run 11
+#   (each also takes --date YYYY-MM-DD, the run's first day, default today, and --scratchpad
+#   <folder>, default <common .git>/ap-autopilot/tmp)
+#
+# The file is <common .git>/ap-autopilot/briefs/<name>-<run>-<issue or pull request>.md: inside
+# git's folder, so it is never committed, and every worktree can read it. A word it cannot fill
+# (a value not given here, or not set in .claude/ap.json) is an error, and no file is written: the
+# words an agent fills in itself (<PR> in the helper's brief, <M> in the retro's) stay.
+# Exit 0 written, 2 an error (said on stderr).
+set -euo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/config.sh
+source "$LIB/config.sh" # ap_config_file, ap_python
+# shellcheck source=plugins/ap/lib/run-dir.sh
+source "$LIB/run-dir.sh" # MAIN, COMMON, DIR
+
+help() { sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//'; }
+case ${1:-} in
+  -h | --help) help; exit 0 ;;
+  helper | planner | reviewer | retro) ;;
+  *) help >&2; exit 2 ;;
+esac
+native() { # a path as the Python that runs the brief reads it (C:/... on Windows)
+  if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s\n' "$1"; fi
+}
+name=$1 run=- which=
+for ((i = 2; i <= $#; i++)); do
+  case ${!i} in
+    --run) j=$((i + 1)); run=${!j:-} ;;
+    --pr) j=$((i + 1)); which=pr${!j:-} ;;
+    --n) j=$((i + 1)); n=${!j:-}; [ -n "$which" ] || { read -r which _ <<<"${n//,/ }" || true; which=${which#\#}; } ;;
+  esac
+done
+file=$(ap_config_file) || exit 2
+[ -f "$file" ] || { echo "ap-brief: there is no .claude/ap.json: run /ap:setup first" >&2; exit 2; }
+out=$DIR/briefs/$name-${run#\#}${which:+-$which}.md
+rc=0
+path=$(ap_python "$(<"$LIB/brief.py")" "$file" "$name" "$(native "$(readlink -f "$LIB/..")")" "$(native "$MAIN")" \
+  "$(native "$COMMON")" "$(native "$out")" "${@:2}") || rc=$?
+[ $rc = 0 ] || exit 2
+echo "$path"

@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# The run's list: the open issues a run takes, in the order it takes them. /ap:run builds its
+# list with it (step 2 of skills/run/SKILL.md); it only reads.
+#
+#   ap-list [--label <l>[,<l>...]]... [--not <l>]... [--leave-out <l>]... [--run <run id>] [<N>...]
+#   ap-list --json [--parallel <N>] [--stop-after <N>] [--stop-in <X>] [the options above]
+#
+#   --label      a label limit: every --label is needed; a,b means either one
+#   --not        leaves out the issues with that label
+#   --leave-out  one more label that keeps an issue out (the project's own), as status:blocked does
+#   --run        this run's id: the other runs that go on are the ones that are not it
+#   <N>...       only these issues, in this order (the label limit still holds)
+#   --json       the plan of the run instead (/ap:plan): the issues with their helpers, every
+#                issue left out with why, and with these, which helpers could run at the same
+#                time (--parallel), which start before STOP AFTER (--stop-after), which may start
+#                in the second half of STOP IN (--stop-in); plan() in lib/list.py
+#
+# The order: first the issues a stop left in the middle (status:in-progress, and their last
+# comment starts with **Stopped in the middle.**), but only while no other run goes on (it may be
+# on them); then the approved look-back issues (a [retro] issue with a **Decided** comment), which
+# a kind or --label limit does not leave out, since they change the run itself; then the rest, P0
+# to P3, the lower number first. Every P0 is kept, whatever the limit. The issues with a label of
+# lib/issues.py's LEAVE_OUT are left out, and so is an issue another session may be on: an open
+# pull request or a branch on origin is named for it (`fix/47-slug`), unless it is named or was
+# stopped in the middle. The branches are the main checkout's `origin/*` refs, as the last fetch
+# left them.
+#
+# One line per issue (`#47 P2 <title> area:app size:S`, why it comes first, and the issues one
+# helper does with it: up to 3 size:S issues of one area next to each other), then a
+# "left out: #N (why)" line for each stopped or named issue it leaves out, and each one with an
+# open pull request (`open PR #M`) or a branch (`branch <name>`), then the label limit.
+# Four `gh` calls: the open issues, the ones in progress with their comments, the [retro] ones
+# with their comments, the open pull requests. Exit 0: the list; 2: it could not run (gh's words
+# on stderr).
+set -euo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/config.sh
+source "$LIB/config.sh" # ap_config, ap_python
+# shellcheck source=plugins/ap/lib/run-dir.sh
+source "$LIB/run-dir.sh" # DIR, going_on, remote_branches
+
+usage() {
+  echo "usage: ap-list [--json] [--parallel <N>] [--stop-after <N>] [--stop-in <X>] [--label <l>[,<l>...]]... [--not <l>]... [--leave-out <l>]... [--run <run id>] [<N>...]" >&2
+  exit 2
+}
+args=() run=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --label | --not | --leave-out) [ $# -ge 2 ] && [ -n "$2" ] || usage; args+=("$1" "$2"); shift ;;
+    --run) [ $# -ge 2 ] && [ -n "$2" ] || usage; run=$2; shift ;;
+    --json) args+=(--json) ;;
+    --parallel | --stop-after | --stop-in) [[ ${2:-} =~ ^[0-9]+$ ]] || usage; args+=("$1" "$2"); shift ;;
+    *) [[ $1 =~ ^#?[0-9]+$ ]] || usage; args+=("${1#\#}") ;;
+  esac
+  shift
+done
+
+rc=0; repo=$(ap_config repo) || rc=$?
+[ $rc = 0 ] || { [ $rc = 2 ] || echo "ap-list: .claude/ap.json has no repo: run /ap:setup first" >&2; exit 2; }
+
+FACTS=$(mktemp) ERR=$(mktemp)
+trap 'rm -f "$FACTS" "$ERR"' EXIT
+gh_part() { # name, gh args...: one list as a part of the facts; gh fails: exit 2 with its words
+  printf '@@ %s\n' "$1" >>"$FACTS"
+  gh "${@:2}" >>"$FACTS" 2>"$ERR" || { echo "ap-list: gh could not list $1: $(head -3 "$ERR")" >&2; exit 2; }
+  echo >>"$FACTS"
+}
+gh_part issues issue list --repo "$repo" --state open --limit 500 --json number,title,labels
+gh_part stopped issue list --repo "$repo" --state open --label status:in-progress --limit 100 \
+  --json number,comments
+gh_part lookback issue list --repo "$repo" --state open --search "[retro] in:title" --limit 50 \
+  --json number,comments
+gh_part prs pr list --repo "$repo" --state open --limit 100 --json number,headRefName
+{ echo "@@ branches"; remote_branches; echo "@@ others"; } >>"$FACTS"
+for f in "$DIR"/run-*; do
+  [ -f "$f" ] || continue
+  id=${f##*/run-}
+  if [ "$id" != "$run" ] && going_on "$id"; then echo "$id" >>"$FACTS"; fi
+done
+
+ap_python "$(<"$LIB/issues.py")"$'\n'"$(<"$LIB/list.py")" "$FACTS" "${args[@]}"

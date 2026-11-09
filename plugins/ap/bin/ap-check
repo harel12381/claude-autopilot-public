@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+# The project's check: the steps of every part in `check_parts` of .claude/ap.json, side by side.
+# A pull request merges and the main branch deploys only after it passes.
+#
+#   ap-check                  # check the parts whose inputs have not passed yet
+#   ap-check web api          # only these parts
+#   ap-check --force          # check again even what already passed
+#   ap-check --list           # the parts, their steps and inputs, and which passed already
+#   ap-check --stats [since]  # the summary of the log of every run (since 2026-11-01)
+#   ap-check --suggest        # what /ap:setup suggests for merge_batch and queue_per_slot, from the
+#                             # log and this computer's free memory and disk (lib/suggest.sh)
+#
+# Exit 0 only when every part asked for passed; 1 when one failed; 2 when it could not run (a
+# wrong argument, no check_parts, a broken .claude/ap.json, an input that is not there).
+#
+# The parts are read from the checked tree's own .claude/ap.json (so a branch is checked with the
+# parts it has), or the main checkout's when it has none. Each part:
+#   name         letters, digits, _ . -
+#   inputs       the files and folders (relative to the repository's root) its steps read
+#   dir          where its steps run (default: the root)
+#   light        a command for its light steps (lint, small tests), or none
+#   heavy        a command for its heavy steps (a big build, tests that take much memory), or none
+#   light_first  true: the light steps run first, and an error there ends the part before its
+#                heavy steps; else both start at once
+#   version      a number; change it to check the part again with the same inputs
+#   retry        { "when": "<pattern>", "run": "<command>" }: a step that fails with a log that
+#                matches the pattern (grep -E) is not counted; the command runs once in its place,
+#                and its result counts (a failure that is not the code's, such as a blocked
+#                program, checked another way). With "heavy": true, the command runs under the
+#                heavy lock (a re-check after memory ran out must not run beside heavy steps)
+# And check_options: light_min_mb (3000), step_limit_min (45, 0 for none).
+# The steps run with bash -c in their dir, with AP_CHECK_PART, AP_CHECK_STEP (light or heavy) and
+# AP_CHECK_RUN (this run) set.
+#
+# It checks the working tree as it is, uncommitted changes included. A part that passes is
+# remembered by the git hash of its inputs, with its commands, dir, retry and version, in the
+# repository's common .git folder, with the checkout and the time it passed in (a skipped part
+# names them), so every worktree and ap-deploy see it. The same code is never
+# checked twice: after a squash merge, the files on the main branch have the same hash as on the
+# branch. A failing part prints the end of its log. Each part says how long it took, and how long
+# it waited for other runs. Every run adds one line per part to the log (lib/check-log.sh).
+#
+# Heavy and light steps. Parallel helpers each run this in their own worktree. The heavy steps
+# take a lock in the common .git folder, ap-check.lock: the heavy steps of one run at a time, the
+# others wait. The light steps run beside them when the run starts with at least light_min_mb of
+# memory free; with less, or when the free memory cannot be read, the run takes the heavy lock for
+# all its steps. Each part also has its own lock (ap-check-<part>.lock): one run of a part at a
+# time, so two runs never share a part's build files. A run takes the locks of all its parts first,
+# in one order, and only then the heavy lock: a run that holds the heavy lock never waits for a
+# part's lock, so two runs never wait for each other. A run that may wait belongs in the
+# background (ap-background ap-check).
+#
+# Stopping the shell that started a run (an agent's background task) stops the run too, with
+# every process under it. A step that runs longer than step_limit_min hangs: it is stopped, and
+# fails. AP_CHECK_WATCH_PID names another shell to watch (a script that runs this);
+# AP_CHECK_WATCH_S (5) is how often it looks, 0 for not at all (a run that must outlive its shell).
+set -uo pipefail
+# Bash reads a script while it runs: an update of the plugin during a long run would make it run a
+# mix of two versions. The braces make it read the whole file first.
+{
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/config.sh
+source "$LIB/config.sh" || exit 2
+# shellcheck source=plugins/ap/lib/check-config.sh
+source "$LIB/check-config.sh" || exit 2 # check_config_file, check_config_load
+# shellcheck source=plugins/ap/lib/check-log.sh
+source "$LIB/check-log.sh" || exit 2 # check_log_*
+# shellcheck source=plugins/ap/lib/suggest.sh
+source "$LIB/suggest.sh" || exit 2 # free_mb, check_suggest
+# shellcheck source=plugins/ap/lib/dirlock.sh
+source "$LIB/dirlock.sh" || exit 2
+# shellcheck source=plugins/ap/lib/proc-tree.sh
+source "$LIB/proc-tree.sh" || exit 2 # stop_tree, wait_shell_gone, pid_runs
+
+usage() {
+  echo "usage: ap-check [parts...] [--force] | --list | --stats [since] | --suggest   (exit 0 all passed, 1 one failed, 2 could not run)" >&2
+  exit 2
+}
+if [ "${1:-}" = --stats ]; then
+  [ $# -le 2 ] || usage
+  check_log_stats "${2:-}"; exit
+fi
+if [ "${1:-}" = --suggest ]; then
+  [ $# = 1 ] || usage
+  MAIN=$(ap_main) || exit 2
+  light=$(ap_config check_options.light_min_mb 3000) || exit 2
+  [[ $light =~ ^[0-9]+$ ]] || light=3000
+  check_suggest "$MAIN" "$light"; exit
+fi
+FORCE=0 LIST=0 want=()
+for a in "$@"; do
+  case $a in
+    --force) FORCE=1 ;;
+    --list) LIST=1 ;;
+    -*) usage ;;
+    *) [[ " ${want[*]} " == *" $a "* ]] || want+=("$a") ;;
+  esac
+done
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "ap-check: $PWD is not inside a git checkout" >&2; exit 2; }
+cd "$ROOT" || exit 2
+FILE=$(check_config_file) || exit 2
+rc=0; check_config_load "$FILE" || rc=$?
+if [ $rc = 1 ]; then
+  echo "ap-check: no check_parts in $FILE: list the project's parts there, or set check to the project's own command" >&2
+  exit 2
+fi
+[ $rc = 0 ] || exit 2
+for p in "${PART_NAMES[@]}"; do
+  # grep's exit 2: a pattern it cannot read
+  [ -z "${PART_WHEN[$p]}" ] || { grep -qE -- "${PART_WHEN[$p]}" </dev/null; [ $? != 2 ]; } ||
+    { echo "ap-check: part $p: retry.when is not a pattern grep -E reads: ${PART_WHEN[$p]}" >&2; exit 2; }
+done
+for p in "${want[@]}"; do
+  [[ " ${PART_NAMES[*]} " == *" $p "* ]] || { echo "ap-check: unknown part: $p (parts: ${PART_NAMES[*]})" >&2; exit 2; }
+done
+[ ${#want[@]} -gt 0 ] || want=("${PART_NAMES[@]}")
+rc=0; MAIN_BRANCH=$(ap_read "$FILE" main_branch) || rc=$?
+[ $rc = 0 ] || { [ $rc = 1 ] && MAIN_BRANCH=main; } || exit 2
+
+COMMON=$(git rev-parse --path-format=absolute --git-common-dir) || exit 2
+CACHE=$COMMON/ap-check-cache
+HEAVY=$COMMON/ap-check.lock
+part_lock() { echo "$COMMON/ap-check-$1.lock"; }
+mkdir -p "$CACHE" || exit 2
+LOGS=$(mktemp -d) || exit 2
+trap 'rm -rf "$LOGS"' EXIT
+
+# The hash the working tree would have if committed now: a copy of the index, with every change
+# added (new files too; ignored ones are left out, as a commit leaves them out).
+INDEX=$LOGS/index # in $LOGS: deleted on exit, also when a step here fails
+index=$(git rev-parse --path-format=absolute --git-path index) || exit 2
+[ ! -f "$index" ] || cp "$index" "$INDEX" || exit 2
+GIT_INDEX_FILE=$INDEX git add -A . || { echo "ap-check: could not read the working tree" >&2; exit 2; }
+TREE=$(GIT_INDEX_FILE=$INDEX git write-tree) || exit 2
+
+# Each part's key: the hash of its inputs' hashes, with its commands, dir, retry and version. One
+# git call for every input's hash and one for the keys: each git call costs on Windows.
+specs=()
+for p in "${want[@]}"; do
+  while IFS= read -r i; do
+    if [ "$i" = . ]; then specs+=("$TREE"); else specs+=("$TREE:$i"); fi
+  done <<<"${PART_INPUTS[$p]}"
+done
+# A path that is not there fails the call (and is printed as it was given).
+hashes=() out=
+if out=$(git rev-parse "${specs[@]}" 2>/dev/null); then mapfile -t hashes <<<"$out"; fi
+if [ ${#hashes[@]} != ${#specs[@]} ]; then
+  for p in "${want[@]}"; do
+    while IFS= read -r i; do
+      [ "$i" = . ] || git cat-file -e "$TREE:$i" 2>/dev/null ||
+        echo "ap-check: part $p: its input $i is not in the working tree" >&2
+    done <<<"${PART_INPUTS[$p]}"
+  done
+  exit 2
+fi
+n=0 texts=()
+for p in "${want[@]}"; do
+  {
+    printf 'version %s\ndir %s\nlight_first %s\nlight %s\nheavy %s\nretry %s\n%s\n' "${PART_VERSION[$p]}" \
+      "${PART_DIR[$p]}" "${PART_FIRST[$p]}" "${PART_LIGHT[$p]}" "${PART_HEAVY[$p]}" "${PART_WHEN[$p]}" "${PART_RETRY[$p]}"
+    while IFS= read -r i; do echo "input $i ${hashes[n]}"; n=$((n + 1)); done <<<"${PART_INPUTS[$p]}"
+  } >"$LOGS/$p.key"
+  texts+=("$LOGS/$p.key")
+done
+mapfile -t keys < <(git hash-object --no-filters -- "${texts[@]}")
+[ ${#keys[@]} = ${#want[@]} ] || { echo "ap-check: could not hash the parts' inputs" >&2; exit 2; }
+declare -A KEY=()
+for n in "${!want[@]}"; do KEY[${want[n]}]="${want[n]}-${keys[n]}"; done
+passed() { [ $FORCE = 0 ] && [ -f "$CACHE/${KEY[$1]}" ]; }
+passed_where() { # part: " (<checkout>, <time>)", where and when the same code passed, or nothing
+  local at=
+  read -r at <"$CACHE/${KEY[$1]}" 2>/dev/null || true
+  [ -z "$at" ] || echo " ($at)"
+}
+
+steps_text() { # part: its steps in words
+  local l=${PART_LIGHT[$1]} h=${PART_HEAVY[$1]}
+  if [ -n "$l" ] && [ -n "$h" ]; then
+    [ "${PART_FIRST[$1]}" = 1 ] && echo "light first, then heavy" || echo "light and heavy"
+  elif [ -n "$l" ]; then echo light
+  else echo heavy
+  fi
+}
+if [ $LIST = 1 ]; then
+  for p in "${want[@]}"; do
+    state="to check"; [ ! -f "$CACHE/${KEY[$p]}" ] || state="passed"
+    printf '%s (%s steps, in %s): %s; inputs: %s\n' "$p" "$(steps_text "$p")" "${PART_DIR[$p]}" "$state" \
+      "$(paste -sd' ' - <<<"${PART_INPUTS[$p]}")"
+  done
+  exit 0
+fi
+check_log_run "$TREE" $FORCE "$MAIN_BRANCH" # what the log says of this run, at its start
+
+# The locks (lib/dirlock.sh). The owner text: the worktree, since when and what for. A heavy lock
+# older than its age limit (a run that hangs) is taken over: twice the step limit, at least 2 hours.
+HEAVY_AGE=0
+[ "$STEP_LIMIT_S" = 0 ] || HEAVY_AGE=$((STEP_LIMIT_S * 2 > 7200 ? STEP_LIMIT_S * 2 : 7200))
+lock() { # lock, what for: waits until this process holds it
+  local limit=0; [ "$1" = "$HEAVY" ] && limit=$HEAVY_AGE
+  dirlock_take "$1" "$ROOT (since $(date +%H:%M)) $2" $limit 1 "$2: waiting for the check that runs in"
+}
+unlock() { dirlock_free "$1"; }
+
+# A run whose shell is gone stops itself. An agent that stops a background check stops only the
+# shell it started this in. Without a watcher, on Windows this script runs on, holding its locks,
+# and every other run waits for a check nobody wants. So a watcher looks at that shell every few
+# seconds. When it is gone, it stops this run with every process under it: their locks are then
+# dead, and the next run takes them over. A run started by a Windows program (PowerShell, a git
+# hook) sees $PPID 1: no watcher.
+export AP_CHECK_RUN=$$
+WATCHED=${AP_CHECK_WATCH_PID:-$PPID} # $PPID: the shell that started this run, in subshells too
+EVERY=${AP_CHECK_WATCH_S:-5}
+watch_shell() { # until this run ends
+  local main=$$
+  wait_shell_gone "$WATCHED" "$main" "$EVERY" || return 0
+  echo "ap-check: the shell that started this check is gone: stopping it." >&2
+  rm -rf "$LOGS"
+  stop_tree "$main"
+}
+WATCH=
+[ "$WATCHED" -gt 1 ] && [ "$EVERY" != 0 ] && { watch_shell </dev/null & WATCH=$!; }
+HELD_PARTS=() # the part locks this shell holds
+# At the end, and when the run is stopped (TERM, INT, HUP): the steps that still run are stopped
+# with what runs under them before the locks are freed, so no other run starts beside them.
+stop_jobs() {
+  local j
+  [ -z "$WATCH" ] || kill "$WATCH" 2>/dev/null
+  for j in $(jobs -p); do stop_tree "$j"; done
+}
+trap 'stop_jobs; unlock "$HEAVY"
+  for p in "${HELD_PARTS[@]}"; do unlock "$(part_lock "$p")"; done; rm -rf "$LOGS"' EXIT
+trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
+
+# A step that hangs is stopped: it would hold its part's lock, and every other run of the part would
+# wait for it.
+limit_text() { if [ "$STEP_LIMIT_S" -lt 120 ]; then echo "$STEP_LIMIT_S s"; else echo "$((STEP_LIMIT_S / 60)) minutes"; fi; }
+limited() { # part, light|heavy, command: runs it in the part's dir; stopped with what runs under
+  # it after STEP_LIMIT_S. The watchdog looks every few seconds rather than one long sleep: a sleep
+  # it started would outlive it by up to STEP_LIMIT_S.
+  local job dog rc every=$((STEP_LIMIT_S < 5 ? STEP_LIMIT_S : 5))
+  # The heavy lock is judged by its age: a run that holds it says at each step that it still runs.
+  [ $HELD = 0 ] || touch "$HEAVY" 2>/dev/null
+  ( cd "$ROOT/${PART_DIR[$1]}" && AP_CHECK_PART=$1 AP_CHECK_STEP=$2 exec bash -c "$3" ) & job=$!
+  echo "$job" >"$LOGS/$1-$2.step" # stopped by the main shell when this job is killed (stop_step)
+  if [ "$STEP_LIMIT_S" -gt 0 ]; then
+    ( for ((i = 0; i < STEP_LIMIT_S; i += every)); do sleep "$every"; pid_runs "$job" || exit 0; done
+      : >"$LOGS/$1-$2.hung"; stop_tree "$job" ) </dev/null >/dev/null 2>&1 & dog=$!
+  fi
+  wait "$job"; rc=$?
+  # Stopped by the watchdog: the step went first (stop_tree stops the top first), and the watchdog
+  # still stops what ran under it. Killing it now would leave those running.
+  if [ -n "${dog:-}" ]; then
+    [ -f "$LOGS/$1-$2.hung" ] || kill "$dog" 2>/dev/null
+    wait "$dog" 2>/dev/null
+  fi
+  return $rc
+}
+said_hung() { # part, light|heavy: true, and says so, when limited stopped these steps
+  [ -f "$LOGS/$1-$2.hung" ] || return 1
+  echo "$1: its $2 steps ran for more than $(limit_text) and were stopped." | tee -a "$LOGS/$1.log"
+}
+
+# One try of a part's steps; its words go to the part's log. How it ended: 0 passed, 1 failed,
+# 2 hung (said_hung). Only this try's words count for the retry: a part's light and heavy steps
+# share its log.
+try_step() { # part, light|heavy, command
+  local try=$LOGS/$1-$2.try rc=0
+  limited "$@" >"$try" 2>&1 || rc=1
+  cat "$try" >>"$LOGS/$1.log"
+  [ $rc = 0 ] && return 0
+  said_hung "$1" "$2" && return 2
+  return 1
+}
+
+step() { # part, light|heavy: those steps, then the retry when its rule says so
+  local cmd how
+  if [ "$2" = light ]; then cmd=${PART_LIGHT[$1]}; else cmd=${PART_HEAVY[$1]}; fi
+  try_step "$1" "$2" "$cmd"; how=$?
+  [ $how = 1 ] && [ -n "${PART_WHEN[$1]}" ] && grep -qE -- "${PART_WHEN[$1]}" "$LOGS/$1-$2.try" || return $((how != 0))
+  echo "$1: its $2 steps' log matches the retry rule: running its retry command instead."
+  echo "--- the log matches the retry rule (${PART_WHEN[$1]}); its retry command instead:" >>"$LOGS/$1.log"
+  echo retry >"$LOGS/$1.again"
+  [ "${PART_RHEAVY[$1]}" = 0 ] || retry_lock "$1"
+  try_step "$1" "$2" "${PART_RETRY[$1]}"; how=$?
+  [ "${PART_RHEAVY[$1]}" = 0 ] || dirlock_free "$HEAVY" # only when this job took it
+  return $((how != 0))
+}
+
+# The heavy lock for a retry with "heavy": true, in the step's own job. Held by this run already
+# (its main shell, for its heavy steps or all its steps): the retry shares it, as heavy steps of one
+# run do, and the main shell keeps it until the run's light steps end (HEAVY_RETRY). Else this job
+# takes it. It looks at the owner on each try, so it never waits for its own run.
+retry_lock() { # part
+  local t=$SECONDS said=0 o
+  until o=$(dirlock_owner "$HEAVY"); [ "${o%% *}" = "$$" ] || dirlock_try "$HEAVY" "$ROOT (since $(date +%H:%M)) the retry of $1" "$HEAVY_AGE"; do
+    o=$(dirlock_owner "$HEAVY")
+    if [ $said = 0 ] && [ -n "$o" ]; then echo "the retry of $1: waiting for the check that runs in ${o#* }"; said=1; fi
+    sleep 1
+  done
+  waited_since "$1" $t " for the heavy lock"
+}
+
+keep_time() { # part, took|waited, seconds, what it says: in the part's line (.took) and its log line (.secs)
+  echo "$4" >>"$LOGS/$1.took"
+  echo "$2 $3" >>"$LOGS/$1.secs"
+}
+waited_since() { # part, start (SECONDS), for what: keeps the wait when it was longer than a second
+  local s=$((SECONDS - $2))
+  [ $s -le 1 ] || keep_time "$1" waited $s "waited $s s${3:-}"
+}
+
+timed() { # part, light|heavy: runs the steps, and keeps how long they took
+  local t=$SECONDS rc
+  step "$1" "$2"; rc=$?
+  keep_time "$1" took $((SECONDS - t)) "$2 steps $((SECONDS - t)) s"
+  return $rc
+}
+
+light_job() { # part: its light steps (run in the background; the main shell holds its lock)
+  timed "$1" light
+}
+
+remember() { # part: it passed, in this checkout, now. A file that cannot be written is said at the end.
+  printf '%s, %(%Y-%m-%d %H:%M)T
+' "${ROOT##*/}" -1 2>/dev/null >"$CACHE/${KEY[$1]}" || : >"$LOGS/$1.forgot"
+}
+
+heavy_job() { # part: its heavy steps, in the background, under the heavy lock (taken here, in the
+  # main shell, so that the heavy steps of this run's parts share it)
+  local t=$SECONDS
+  if [ $HELD = 0 ]; then
+    lock "$HEAVY" "heavy steps of $1"; HELD=1
+    waited_since "$1" $t " for the heavy lock"
+  fi
+  in_job "$1" heavy timed "$1" heavy & hpid[$1]=$!
+}
+
+in_job() { # part, light|heavy, command...: runs the command (in a background job), then marks
+  # these steps of the part as ended, for the main shell's loop; the command's exit code
+  local rc=0
+  "${@:3}" || rc=$?
+  : >"$LOGS/$1-$2.ended"
+  return $rc
+}
+ended() { [ -f "$LOGS/$1-$2.ended" ]; } # part, light|heavy
+
+parts=()
+for p in "${want[@]}"; do
+  if passed "$p"; then echo "$p: passed before$(passed_where "$p"), skipped"; continue; fi
+  parts+=("$p")
+done
+has() { [[ " ${parts[*]} " == *" $1 "* ]]; }
+skipped() { [ -f "$LOGS/$1.skipped" ]; }
+first() { [ -n "${PART_LIGHT[$1]}" ] && [ "${PART_FIRST[$1]}" = 1 ]; } # its heavy steps wait for its light ones
+mapfile -t heavy_parts < <(for p in "${parts[@]}"; do [ -z "${PART_HEAVY[$p]}" ] || echo "$p"; done)
+
+declare -A pid=() hpid=() lrc=() hrc=()
+HELD=0 # this run holds the heavy lock
+LOW_MEM=0 # it took it for every step
+HEAVY_RETRY=0 # a light step of this run has a retry that runs under the heavy lock
+for p in "${parts[@]}"; do [ -z "${PART_LIGHT[$p]}" ] || [ "${PART_RHEAVY[$p]}" = 0 ] || HEAVY_RETRY=1; done
+# Every part's lock first, in one order, before the heavy lock is ever taken (see the top). A part
+# with heavy steps keeps it to the end, so that another run never changes its files between its
+# light and heavy steps; a part with light steps only frees it when they end.
+mapfile -t sorted < <(printf '%s\n' "${parts[@]}" | LC_ALL=C sort)
+for p in "${sorted[@]}"; do
+  [ -n "$p" ] || continue
+  t=$SECONDS
+  lock "$(part_lock "$p")" "$p"; HELD_PARTS+=("$p")
+  # Another worktree's run may have checked the same code while this one waited.
+  if passed "$p"; then : >"$LOGS/$p.skipped"; unlock "$(part_lock "$p")"; else waited_since "$p" $t; fi
+done
+if [ ${#parts[@]} -gt 0 ] && [ "$(free_mb)" -lt "$LIGHT_MIN_MB" ]; then
+  # Said only when it changes something: light steps that could have run beside this run's heavy
+  # steps, or beside another run's (it holds the heavy lock now, so this run will wait).
+  low_mem() { echo "Less than $LIGHT_MIN_MB MB of memory free (or it cannot be read): every step of this run under the heavy lock."; }
+  [ ${#heavy_parts[@]} = 0 ] && [ ! -d "$HEAVY" ] || low_mem # the heavy lock is free now, or held
+  t=$SECONDS
+  lock "$HEAVY" "every step of ${parts[*]} (little memory free)"; HELD=1 LOW_MEM=1
+  for p in "${parts[@]}"; do waited_since "$p" $t " for the heavy lock"; done
+fi
+for p in "${parts[@]}"; do
+  skipped "$p" && continue
+  if [ -n "${PART_LIGHT[$p]}" ]; then in_job "$p" light light_job "$p" & pid[$p]=$!; fi
+done
+part_passed() { # part: its light and heavy steps (those it has) passed
+  { [ -z "${PART_LIGHT[$1]}" ] || [ "${lrc[$1]:-1}" = 0 ]; } && { [ -z "${PART_HEAVY[$1]}" ] || [ "${hrc[$1]:-1}" = 0 ]; }
+}
+free_part() { # part: remembered when it passed, before its lock is freed, so a run that waits
+  # for the lock then skips it
+  skipped "$1" || ! part_passed "$1" || remember "$1"
+  unlock "$(part_lock "$1")"
+}
+# Heavy steps start at once, but those of a part whose light steps come first: after they passed.
+for p in "${heavy_parts[@]}"; do
+  skipped "$p" || first "$p" || heavy_job "$p"
+done
+# Until every job ended, a look every half second at which ended (bash 5.0 has no `wait -n -p`):
+#   - a part with light steps only frees its lock at once, so another run need not wait for this
+#     run's heavy steps;
+#   - a part whose light steps come first starts its heavy steps when they passed;
+#   - the heavy lock is freed once no heavy step runs or may still start, so other runs need not
+#     wait for this run's light steps; it is kept with little memory, or while a light step's
+#     retry may share it.
+# A job whose process is gone without its mark (killed with -9, or by the system when memory ran
+# out) has ended too: `wait` gives its exit code, and its part fails.
+gone() { ! kill -0 "$1" 2>/dev/null; } # pid of a job of this shell: bash reaps it, never a zombie
+stop_step() { # part, light|heavy: a job that is gone without its mark: the step it started, with
+  # what runs under it, is stopped before the part's lock is freed
+  local s
+  ended "$1" "$2" || ! read -r s <"$LOGS/$1-$2.step" 2>/dev/null || stop_tree "$s"
+}
+while [ ${#pid[@]} -gt 0 ] || [ ${#hpid[@]} -gt 0 ]; do
+  ready=() # light-first parts whose light steps passed: their heavy steps start after this pass,
+  # which frees the light-only parts that ended first (heavy_job may wait for the heavy lock)
+  for p in "${!pid[@]}"; do
+    ended "$p" light || gone "${pid[$p]}" || continue
+    wait "${pid[$p]}"; lrc[$p]=$?; unset "pid[$p]"
+    stop_step "$p" light
+    if [ -z "${PART_HEAVY[$p]}" ]; then free_part "$p"
+    elif first "$p" && [ "${lrc[$p]}" = 0 ]; then ready+=("$p")
+    fi
+  done
+  for p in "${ready[@]}"; do heavy_job "$p"; done
+  for p in "${!hpid[@]}"; do
+    ended "$p" heavy || gone "${hpid[$p]}" || continue
+    wait "${hpid[$p]}"; hrc[$p]=$?; unset "hpid[$p]"
+    stop_step "$p" heavy
+  done
+  if [ $HELD = 1 ] && [ ${#hpid[@]} = 0 ] && [ $LOW_MEM = 0 ] && [ $HEAVY_RETRY = 0 ]; then
+    later=0; for p in "${!pid[@]}"; do [ -z "${PART_HEAVY[$p]}" ] || ! first "$p" || later=1; done
+    [ $later = 1 ] || { unlock "$HEAVY"; HELD=0; }
+  fi
+  [ ${#pid[@]} = 0 ] && [ ${#hpid[@]} = 0 ] || sleep 0.5
+done
+unlock "$HEAVY"
+for p in "${HELD_PARTS[@]}"; do free_part "$p"; done
+HELD_PARTS=()
+
+# Each part's result, and its line in the log: every part asked for, those that passed before too.
+failed=() lines=
+printf -v now '%(%Y-%m-%dT%H:%M:%S%z)T' -1
+for p in "${want[@]}"; do
+  if ! has "$p" || skipped "$p"; then result=skipped
+  elif part_passed "$p"; then result=passed
+  elif [ -f "$LOGS/$p-light.hung" ] || [ -f "$LOGS/$p-heavy.hung" ]; then result=hung
+  else result=failed
+  fi
+  if has "$p"; then
+    took=$(paste -sd, "$LOGS/$p.took" 2>/dev/null | sed 's/,/, /g')
+    case $result in
+      skipped) echo "$p: passed in another run meanwhile$(passed_where "$p"), skipped" ;;
+      passed) [ ! -f "$LOGS/$p.forgot" ] || echo "$p: could not remember that it passed ($CACHE)"
+        echo "$p: passed ($took)" ;;
+      *) failed+=("$p")
+        echo "$p: FAILED ($took). The end of its log:"
+        tail -40 "$LOGS/$p.log" 2>/dev/null | sed 's/^/  /' ;;
+    esac
+  fi
+  check_log_times "$LOGS/$p.secs"
+  again=-; [ -f "$LOGS/$p.again" ] && read -r again <"$LOGS/$p.again"
+  lines+=$(check_log_line "$now" "$p" $result "$CHECK_LOG_TOOK" "$CHECK_LOG_WAITED" "$again" "${CHECK_LOG_RUN[@]}" $SECONDS "$CHECK_LOG_FLAGS" "${CHECK_LOG_MORE[@]}")$'\n'
+done
+printf %s "$lines" >>"$COMMON/$CHECK_LOG" || echo "This run could not be added to the log ($COMMON/$CHECK_LOG)."
+
+if [ ${#failed[@]} -gt 0 ]; then echo "Failed: ${failed[*]}"; exit 1; fi
+echo "All checks passed."
+
+exit
+}

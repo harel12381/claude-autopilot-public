@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# Merges a few approved pull requests together, checked once, in place of one check at each merge
+# turn (merge_batch in .claude/ap.json; the manager runs it, section 4d of skills/run/SKILL.md).
+#
+#   ap-git-sync fetch && ap-batch check <run> <branch>...   # in the main checkout; through
+#                                                           # ap-background when the check is long
+#   ap-batch merge <run>                                    # the pull requests of the batch that passed
+#
+# check: it reads the commit of origin/<main_branch> and of each origin/<branch> once, at its
+# start, and from then on uses only these commits: a fetch during the check changes nothing it
+# checks or writes down. In the worktree <main checkout>/.claude/worktrees/check-batch-<run>,
+# detached at main's commit, it merges each branch's commit in the order given (git merge --no-ff;
+# these merge commits stay on this computer). A branch that does not merge cleanly leaves the
+# batch, and its merge is undone. Then hooks.check_setup and `check` on the batch (both from its
+# own .claude/ap.json, the main checkout's when it has none), once, as
+# ap-check-branch does, with AP_CHECK_KIND=batch and AP_CHECK_BATCH=<how many> for ap-check's log.
+# When the check fails, it finds the first branch that breaks it by halves: it checks the batch up
+# to its middle branch (AP_CHECK_KIND=bisect), then the half where the break is, until it has the
+# branch with which the check fails and before which it passes. When that is the first branch, it
+# checks main's commit alone too: a main that fails is not that branch's fault. A check that could
+# not run (exit 90 or 91 of ap-check-branch's range, or 2 when `check` is ap-check) is no break:
+# it stops at once, with no halves. It writes down main's commit, the branches that passed
+# together with the commits it merged, and the checked tree (<.git>/ap-autopilot/batch-<run>),
+# for `merge`. The worktree is removed at the end, also when the check fails or the script is
+# stopped.
+#
+# Its lines: `conflict <branch>` and `missing <branch>` (no origin/<branch>) as the merges go,
+# then one line per branch of the batch, in its order:
+#   passed <branch>    checked with the ones before it: `ap-batch merge` merges it
+#   breaks <branch>    the first one with which the check fails: back to its helper
+#   later <branch>     after the one that breaks: not checked; it goes in the next batch
+# and a last line that sums it up. A conflict goes back to its helper's merge turn.
+# Exit: 0 the batch passed; 1 the check failed (a breaks line); 3 nothing to check (every branch
+# conflicts or is missing); 4 main's commit itself fails the check; 2 wrong use; and as
+# ap-check-branch: 90 it could not run (no `check`, no worktree, or the check itself could not
+# run), 91 hooks.check_setup failed.
+#
+# merge: first `ap-git-sync fetch`; when origin/<main_branch> is no longer the commit the batch
+# was checked on, it merges nothing (check the batch again). Else, for each branch that passed, in
+# its order: its open pull request, only when its last commit is the one the batch merged, merged
+# with `gh pr merge --squash --match-head-commit`. A merge that GitHub refuses for a moment ("Base
+# branch was modified", while it works out the merge after the one before) is tried again, three
+# times at most. The first one that is not merged ends the merges. Then `ap-git-sync fetch` again:
+# whatever was merged, origin/<main_branch> must have the tree the batch checked. Its lines:
+# `merged #<PR> <branch>`, then a last line. The batch is used once: a second merge finds nothing.
+# AP_BATCH_MERGE_WAIT_S (10) is the wait between two tries.
+# Exit: 0 every one merged, and main is the checked tree; 1 nothing was merged (the first one was
+# refused: the batch goes back to be checked); 3 something was merged, but main is not the tree
+# that was checked (not all were merged, or another hand changed main): check main at once (the
+# project's check in the main checkout, after ap-git-sync pull), before any other merge; 4 main
+# moved since the check: nothing merged; 2 wrong use; 90 no batch that passed for this run, the
+# settings cannot be read, or the first fetch failed (nothing merged, the batch is kept for a
+# second try).
+set -uo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/hooks.sh
+source "$LIB/hooks.sh" || exit 90 # ap_main, ap_config, hook_cmd, hook_run
+# shellcheck source=plugins/ap/lib/proc-tree.sh
+source "$LIB/proc-tree.sh" || exit 90 # stop_folder_users
+# shellcheck source=plugins/ap/lib/check-tree.sh
+source "$LIB/check-tree.sh" || exit 90 # check_tree_make, check_tree_remove, check_tree_run
+# shellcheck source=plugins/ap/lib/run-dir.sh
+source "$LIB/run-dir.sh" # MAIN, DIR
+CANT=90 SETUP_FAILED=91
+MERGE_TRIES=3 MERGE_WAIT_S=${AP_BATCH_MERGE_WAIT_S:-10}
+
+say() { echo "ap-batch: $*"; }
+die() { echo "ap-batch: $*" >&2; exit $CANT; }
+usage() {
+  echo "usage: ap-batch check <run> <branch>... | merge <run>   (check: 0 passed, 1 failed, 3 nothing to check, 4 main fails;" \
+    "merge: 0 merged, 1 none merged, 3 main is not the checked tree, 4 main moved; 90 could not run, 91 hooks.check_setup failed)" >&2
+  exit 2
+}
+setting() { # variable, key [folder]: sets it, from the folder's settings (ap_config_at) when one
+  # is given; the script ends when the key is missing or cannot be read
+  local v rc=0
+  v=$(ap_config_at "${3:-}" "$2") || rc=$?
+  [ $rc = 0 ] || { [ $rc = 2 ] && exit $CANT; die "no $2 set in .claude/ap.json"; }
+  printf -v "$1" '%s' "$v"
+}
+
+[ $# -ge 2 ] && [[ $2 =~ ^[0-9A-Za-z-]+$ ]] || usage
+cmd=$1 run=$2
+shift 2
+[ -f "$DIR/run-$run" ] || die "no run $run (ap-run start)"
+RECORD=$DIR/batch-$run WT=$MAIN/.claude/worktrees/check-batch-$run
+setting main main_branch
+
+batch_check() { # branches...
+  local check setup base b sha n k lo hi mid rc at
+  local good=() shas=() commits=() missing=() conflicts=()
+  rm -f "$RECORD"
+  base=$(git -C "$MAIN" rev-parse -q --verify "refs/remotes/origin/$main^{commit}") || die "no origin/$main (ap-git-sync fetch first)"
+  check_tree_make "$MAIN" "$WT" "$base" || exit $CANT
+  trap 'check_tree_remove "$MAIN" "$WT" || true' EXIT
+  trap 'exit 143' INT TERM HUP
+  for b in "$@"; do
+    if ! sha=$(git -C "$MAIN" rev-parse -q --verify "refs/remotes/origin/$b^{commit}"); then
+      echo "missing $b"; missing+=("$b"); continue
+    fi
+    if git -C "$WT" -c user.name=ap-batch -c user.email=ap-batch@localhost merge -q --no-ff --no-edit \
+      -m "Batch: merge $b" "$sha" >/dev/null 2>&1; then
+      good+=("$b") shas+=("$sha") commits+=("$(git -C "$WT" rev-parse HEAD)")
+    else
+      git -C "$WT" merge --abort 2>/dev/null || git -C "$WT" reset -q --hard
+      echo "conflict $b"; conflicts+=("$b")
+    fi
+  done
+  n=${#good[@]}
+  [ "$n" -gt 0 ] || { say "nothing to check: ${#conflicts[@]} conflict, ${#missing[@]} missing"; exit 3; }
+
+  could_not_run() { # the check's exit code: it did not judge the code
+    [ "$1" = 90 ] || [ "$1" = 91 ] || { [ "$1" = 2 ] && [[ $check == ap-check || $check == "ap-check "* ]]; }
+  }
+  check_at() { # k (0: main alone), kind for the log: checks the batch up to its k-th branch
+    if [ "$1" = 0 ]; then at=$base; else at=${commits[$1 - 1]}; fi
+    git -C "$WT" checkout -q -f --detach "$at" && git -C "$WT" clean -fdq || exit $CANT
+    setting check check "$WT"
+    setup=$(hook_cmd check_setup "$WT") || exit $CANT
+    rc=0
+    AP_CHECK_KIND=$2 AP_CHECK_BATCH=$1 check_tree_run "$WT" "$setup" "$check" "the batch of $1" || rc=$?
+    [ "$CHECK_TREE_SETUP_FAILED" = 0 ] || exit $SETUP_FAILED
+    if could_not_run $rc; then say "the check could not run (exit $rc): no branch is to blame"; exit $CANT; fi
+    return $rc
+  }
+  record() { # k: the first k branches passed together
+    { echo "base $base"
+      echo "tree $(git -C "$WT" rev-parse "${commits[$1 - 1]}^{tree}")"
+      for ((k = 0; k < $1; k++)); do echo "${good[k]} ${shas[k]}"; done
+    } >"$RECORD"
+  }
+  say "checking ${good[*]} on origin/$main"
+  if check_at "$n" batch; then
+    record "$n"
+    for b in "${good[@]}"; do echo "passed $b"; done
+    say "the batch of $n passed: ap-batch merge $run"
+    exit 0
+  fi
+  # The batch up to lo passes (0: main, checked before the run), up to hi fails.
+  lo=0 hi=$n
+  while [ $((hi - lo)) -gt 1 ]; do
+    mid=$(((lo + hi) / 2))
+    say "the check failed: checking the first $mid of ${good[*]:0:hi}"
+    if check_at "$mid" bisect; then lo=$mid; else hi=$mid; fi
+  done
+  if [ "$hi" = 1 ] && ! check_at 0 -; then
+    say "origin/$main fails the check by itself: main is red, no branch is to blame"
+    exit 4
+  fi
+  [ "$lo" = 0 ] || record "$lo"
+  for ((k = 0; k < n; k++)); do
+    if [ $k -lt "$lo" ]; then echo "passed ${good[k]}"
+    elif [ $k = "$lo" ]; then echo "breaks ${good[k]}"
+    else echo "later ${good[k]}"
+    fi
+  done
+  say "${good[lo]} breaks the check;" "$([ "$lo" = 0 ] && echo "nothing to merge" || echo "the $lo before it passed: ap-batch merge $run")"
+  exit 1
+}
+
+merge_one() { # pull request, commit: the squash merge, tried again while GitHub works out the
+  # merge after the one before
+  local try out
+  for ((try = 1; ; try++)); do
+    out=$(gh pr merge "$1" --repo "$repo" --squash --match-head-commit "$2" 2>&1) && { [ -z "$out" ] || echo "$out"; return 0; }
+    echo "$out" >&2
+    [[ $out == *"Base branch was modified"* ]] && [ "$try" -lt "$MERGE_TRIES" ] || return 1
+    sleep "$MERGE_WAIT_S"
+  done
+}
+
+fetch() { (cd "$MAIN" && ap-git-sync fetch -q); }
+
+batch_merge() {
+  local base tree b sha pr head lines=() l merged=0 t
+  [ $# = 0 ] || usage
+  [ -s "$RECORD" ] || die "no batch that passed for the run $run: ap-batch check first"
+  setting repo repo
+  mapfile -t lines <"$RECORD"
+  base=${lines[0]#base } tree=${lines[1]#tree }
+  fetch || die "ap-git-sync fetch failed: nothing merged, and the batch is kept: a problem of the run, not of a pull request"
+  rm -f "$RECORD"
+  t=$(git -C "$MAIN" rev-parse -q --verify "refs/remotes/origin/$main^{commit}") || t=missing
+  [ "$t" = "$base" ] || { echo "ap-batch: origin/$main moved since the batch was checked: nothing merged; check the batch again" >&2; exit 4; }
+  for l in "${lines[@]:2}"; do
+    read -r b sha <<<"$l"
+    pr= head=
+    read -r pr head < <(gh pr list --repo "$repo" --head "$b" --state open --json number,headRefOid \
+      --jq '.[0] | "\(.number) \(.headRefOid)"') || true
+    if [ -z "$pr" ] || [ "$pr" = null ]; then echo "ap-batch: no open pull request for $b: not merged" >&2; break; fi
+    if [ "$head" != "$sha" ]; then echo "ap-batch: #$pr ($b) has a commit the batch did not check: not merged" >&2; break; fi
+    merge_one "$pr" "$sha" || { echo "ap-batch: GitHub did not merge #$pr ($b)" >&2; break; }
+    echo "merged #$pr $b"; merged=$((merged + 1))
+  done
+  [ $merged -gt 0 ] || { say "nothing merged: the batch goes back to be checked"; exit 1; }
+  fetch || { echo "ap-batch: $merged merged, but ap-git-sync fetch failed: check main" >&2; exit 3; }
+  t=$(git -C "$MAIN" rev-parse "origin/$main^{tree}")
+  if [ "$t" != "$tree" ] || [ $merged != $((${#lines[@]} - 2)) ]; then
+    echo "ap-batch: $merged of $((${#lines[@]} - 2)) merged, but origin/$main is not the tree the batch checked: check main now, before any other merge" >&2
+    exit 3
+  fi
+  say "all $merged merged; origin/$main is the tree the batch checked"
+}
+
+case $cmd in
+  check) [ $# -gt 0 ] || usage; batch_check "$@" ;;
+  merge) batch_merge "$@" ;;
+  *) usage ;;
+esac

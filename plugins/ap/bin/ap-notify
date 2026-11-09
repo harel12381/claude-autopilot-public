@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Sends one short message to the owner's phone, through the project's hook hooks.notify in
+# .claude/ap.json.
+#
+#   ap-notify [--high] [--hold <minutes>] <title> <text> [<url>]
+#
+#   --high       high priority: something broke, or a run stopped.
+#   --hold <m>   at most one message with this title every <m> minutes. A message inside that
+#                time is kept, and goes with the next message that is sent, of any title (the
+#                end of a run sends what is kept, so nothing waits for the next run).
+#   <url>        opens when the owner taps the message (an issue, a pull request).
+#
+# The hook runs in the main checkout as `<hook> --title <title> [--high] [--url <url>]`, with the
+# text on its input. No hook set: the message is only printed here (exit 0). A hook that fails:
+# exit 1, and the kept messages stay for the next one.
+#
+# Short, simple words, and never a secret: the text is shown on the phone's lock screen.
+# The kept messages and the times are files in the repository's common .git folder (every
+# worktree sees the same ones): ap-notify.held and ap-notify.sent-<title>; or in AP_NOTIFY_STATE.
+set -euo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/hooks.sh
+source "$LIB/hooks.sh"
+
+usage() { echo 'usage: ap-notify [--high] [--hold <minutes>] <title> <text> [<url>]' >&2; exit 2; }
+high= hold=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --high) high=1; shift ;;
+    --hold) [[ ${2:-} =~ ^[0-9]+$ ]] || usage; hold=$2; shift 2 ;;
+    -*) usage ;;
+    *) break ;;
+  esac
+done
+{ [ $# -ge 2 ] && [ $# -le 3 ] && [ -n "$1" ] && [ -n "$2" ]; } || usage
+title=$1 text=$2 url=${3:-}
+
+state=${AP_NOTIFY_STATE:-$(git rev-parse --path-format=absolute --git-common-dir)}
+held="$state/ap-notify.held"
+sent="$state/ap-notify.sent-$(printf %s "$title" | tr -c 'A-Za-z0-9' _)"
+if [ -n "$hold" ] && [ -n "$(find "$sent" -mmin "-$hold" 2>/dev/null)" ]; then
+  printf '%s\n' "$text" >>"$held"
+  echo "Held: a message titled \"$title\" went out less than $hold minutes ago. This one goes with the next."
+  exit 0
+fi
+[ -s "$held" ] && text="$text"$'\n\nHeld before:\n'"$(cat "$held")"
+
+hook=$(hook_cmd notify)
+if [ -z "$hook" ]; then
+  printf '%s\n%s\n' "$title" "$text"
+  [ -z "$url" ] || printf '%s\n' "$url"
+  echo "No hooks.notify in .claude/ap.json: the message above was only printed here, not sent."
+else
+  args=(--title "$title")
+  [ -z "$high" ] || args+=(--high)
+  [ -z "$url" ] || args+=(--url "$url")
+  rc=0
+  printf '%s\n' "$text" | hook_run "$hook" "$(ap_main)" "${args[@]}" >/dev/null || rc=$?
+  if [ $rc != 0 ]; then
+    echo "ap-notify: hooks.notify failed (exit $rc): \"$title\" was not sent" >&2
+    exit 1
+  fi
+  echo "Sent: $title"
+fi
+
+rm -f "$held"
+[ -z "$hold" ] || touch "$sent"

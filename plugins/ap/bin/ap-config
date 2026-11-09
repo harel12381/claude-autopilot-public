@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Prints one value of the project's settings, .claude/ap.json in the main checkout (every
+# worktree of the repository reads the same file).
+#
+#   ap-config <key> [default]     # a dotted key: ap-config hooks.notify
+#
+# A string is printed as it is; a number, a boolean or an object as JSON. A key that is missing
+# or null: the default, or exit 1 when none is given. Exit 2: the file is not valid JSON, no
+# Python 3 runs here to read it, or this is not inside a git repository (a broken file never
+# looks like a missing setting, also with a default).
+set -euo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/config.sh
+source "$LIB/config.sh"
+
+usage() { echo "usage: ap-config <key> [default]" >&2; exit 2; }
+{ [ $# -ge 1 ] && [ $# -le 2 ] && [ -n "$1" ]; } || usage
+ap_config "$@"

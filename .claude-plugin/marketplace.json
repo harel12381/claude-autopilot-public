@@ -1,0 +1,11 @@
+{
+  "name": "claude-autopilot",
+  "owner": { "name": "harel12381" },
+  "plugins": [
+    {
+      "name": "ap",
+      "source": "./plugins/ap",
+      "description": "Autopilot runs and the issue workflow: helpers that take GitHub issues to merged pull requests, a fresh review before each merge, and the owner's questions kept on the issues."
+    }
+  ]
+}

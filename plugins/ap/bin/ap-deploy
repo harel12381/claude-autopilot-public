@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Deploys the main branch: the project's check first, then its `deploy` command, so a deploy never
+# goes out without a passing check.
+#
+#   ap-deploy
+#
+# It refuses unless it runs in the main checkout, on main_branch, with nothing that is not
+# committed (new files too), and HEAD is origin/<main_branch> after `ap-git-sync fetch`. Then it
+# runs `ap-check` (every part of check_parts; quick after the merges, which passed already), or
+# the `check` command when there are no check_parts. Only when the check passes does it run
+# `deploy`, in the main checkout, with AP_DEPLOY_COMMIT set to the commit that was checked: the
+# deploy must put out that commit (HEAD of the main checkout), never a newer origin/<main_branch>.
+# Before it, origin/<main_branch> is fetched again: when it moved during the check, it stops (pull
+# and run it again). No `deploy` set: it says so and exits 0.
+#
+# While the deploy command runs, it holds the deploy lock, the folder ap-deploy.lock in the
+# repository's common .git folder (a second ap-deploy waits for it), and after it, it adds one
+# line "<start> <end>" (seconds since 1970) to ap-deploy-times there. ap-qa waits for the lock,
+# and does not judge the checks a deploy ran beside.
+#
+# Exit codes:
+#   0  deployed, or no deploy set
+#   2  it could not run: an argument, .claude/ap.json cannot be read, no main_branch, or no check
+#      (neither check_parts nor check)
+#   3  refused: not the main checkout, not on main_branch, changes not committed, HEAD is not
+#      origin/<main_branch>, or origin/<main_branch> moved during the check
+#   4  ap-git-sync fetch failed
+#   5  the check failed: nothing was deployed
+#   6  the deploy command failed
+set -uo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/config.sh
+source "$LIB/config.sh" || exit 2
+# shellcheck source=plugins/ap/lib/dirlock.sh
+source "$LIB/dirlock.sh"
+
+say() { echo "ap-deploy: $*"; }
+refuse() { echo "ap-deploy: $*: nothing was deployed" >&2; exit 3; }
+setting() { # variable, key: sets the variable to the value; 1 when it is not set; ends the
+  # script when the settings cannot be read (ap_config has said why)
+  local v rc=0
+  v=$(ap_config "$2") || rc=$?
+  [ $rc != 2 ] || exit 2
+  printf -v "$1" '%s' "$v"
+  return $rc
+}
+[ $# = 0 ] || { echo "usage: ap-deploy   (exit 0 deployed, 2 could not run, 3 refused, 4 fetch failed, 5 check failed, 6 deploy failed)" >&2; exit 2; }
+
+MAIN=$(ap_main) || exit 2
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "ap-deploy: $PWD is not inside a git checkout" >&2; exit 2; }
+setting deploy deploy || { say "no deploy set in .claude/ap.json: nothing to deploy."; exit 0; }
+setting main main_branch || { echo "ap-deploy: no main_branch set in .claude/ap.json" >&2; exit 2; }
+
+[ "$(cd "$ROOT" && pwd -P)" = "$(cd "$MAIN" && pwd -P)" ] ||
+  refuse "$ROOT is not the main checkout ($MAIN): run it there"
+cd "$MAIN" || exit 2
+branch=$(git symbolic-ref -q --short HEAD) || branch="a detached HEAD"
+[ "$branch" = "$main" ] || refuse "the main checkout is on $branch, not on $main"
+changes=$(git status --porcelain) || exit 2
+[ -z "$changes" ] || refuse "the main checkout has changes that are not committed: $(head -3 <<<"$changes" | paste -sd, -)"
+ap-git-sync fetch -q || { echo "ap-deploy: ap-git-sync fetch failed: nothing was deployed" >&2; exit 4; }
+there=$(git rev-parse -q --verify "refs/remotes/origin/$main") || refuse "there is no origin/$main"
+if [ "$(git rev-parse HEAD)" != "$there" ]; then
+  refuse "HEAD is not origin/$main ($(git rev-list --count "origin/$main..HEAD") ahead, $(git rev-list --count "HEAD..origin/$main") behind): pull or push first"
+fi
+
+rc=0
+if setting parts check_parts; then
+  say "the check: ap-check"
+  AP_CHECK_WATCH_PID=${AP_CHECK_WATCH_PID:-$PPID} ap-check || rc=$?
+elif setting check check; then
+  say "the check: $check"
+  bash -c "$check" || rc=$?
+else
+  echo "ap-deploy: no check_parts and no check in .claude/ap.json: a deploy needs a check" >&2
+  exit 2
+fi
+[ $rc = 0 ] || { echo "ap-deploy: the check failed (exit $rc): nothing was deployed" >&2; exit 5; }
+
+ap-git-sync fetch -q || { echo "ap-deploy: ap-git-sync fetch failed: nothing was deployed" >&2; exit 4; }
+now=$(git rev-parse -q --verify "refs/remotes/origin/$main") || now=missing
+[ "$now" = "$there" ] || refuse "origin/$main moved during the check (it is $now now, the check was on $there): pull, then run ap-deploy again"
+
+say "the check passed; the deploy: $deploy"
+COMMON=$(git rev-parse --path-format=absolute --git-common-dir) || exit 2
+DEPLOY_LOCK=$COMMON/ap-deploy.lock
+trap 'dirlock_free "$DEPLOY_LOCK"' EXIT
+dirlock_take "$DEPLOY_LOCK" "deploy of $(git rev-parse --short HEAD) (since $(date +%H:%M:%S))" 0 1 "ap-deploy: waiting for"
+start=$EPOCHSECONDS
+rc=0; AP_DEPLOY_COMMIT=$there bash -c "$deploy" || rc=$?
+echo "$start $EPOCHSECONDS" >>"$COMMON/ap-deploy-times"
+dirlock_free "$DEPLOY_LOCK"
+[ $rc = 0 ] || { echo "ap-deploy: the deploy failed (exit $rc)" >&2; exit 6; }
+say "deployed $main at $(git rev-parse --short HEAD)."

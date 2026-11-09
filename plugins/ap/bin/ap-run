@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# Which autopilot run holds which slot worktree, so the end of one run never removes the
+# worktrees, previews or test runs of another.
+#
+# A run that was told to stop can keep its manager session open while a new run uses the same
+# slot worktrees. Two managers do not know about each other, so each run writes down what it holds:
+#
+#   RUN=$(ap-run start)              # a new run; prints its id
+#   ap-run start --alone             # the same, only when no other run goes on (else exit 3, their
+#                                    # ids on stdout): the check and the start under one lock
+#   ap-run alive <RUN>               # before each helper: the run still goes on
+#   ap-run hold <RUN> <s> [<N>]      # before a helper starts issue N in the worktree ap-<s> (alive too;
+#                                    # exit 1: not taken). <s> is a slot number, or a slot number and a
+#                                    # letter for its queue's next worktree (1b, 1c: ap-1b, ap-1c)
+#   ap-run free <RUN> <s>            # the issue in ap-<s> has ended (merged, waiting, failed, ...)
+#   ap-run others <RUN>              # the other runs that still go on, one per line
+#   ap-run stop-previews <RUN>       # every slot preview, or only this run's while another goes on
+#   ap-run cleanup <RUN> [--older-than M] [--min-free-gb N]  # hooks.cleanup with these; it adds
+#                                    # --older-than 90 while another run goes on and none was given
+#   ap-run end <RUN>                 # the end of the run: frees what it holds, and cleans up
+#   ap-run list                      # the runs and the slots they hold
+#   ap-run stop-in|stop-left|stop-wait|stop-clear <RUN> ...  # the stop-in time (lib/run-stop.sh)
+#
+# The project's hooks, from .claude/ap.json (each one missing: that step does nothing, and says so):
+#   hooks.previews_clear  stops every slot preview (run in the main checkout);
+#   hooks.slot_release    stops the preview of one slot (run inside that slot worktree);
+#   hooks.cleanup         stops leftover test runs and deletes their temp files (run in the main
+#                         checkout, with [--older-than <minutes>] [--min-free-gb <n>]; exit 3: the
+#                         disk is low).
+#
+# `stop-previews` runs hooks.previews_clear when no other run goes on; else hooks.slot_release in
+# each slot worktree this run holds. `end` does that, then runs hooks.cleanup: in full when no
+# other run goes on, else only for what is 90 minutes old (--older-than 90). Only then it removes
+# the worktrees the run holds (a process that still runs there holds its files, and Windows does
+# not delete a file in use), each after stopping the build and test tools that still run in it
+# (lib/proc-tree.sh; also a young test run that the cleanup leaves while another run goes on).
+# Then it runs the cleanup once more (what the worktrees now gone left behind). A slot that
+# another run took since (`hold` takes it over) is that run's now: left alone. Two ways a removal
+# fails:
+#   - git refuses (work not committed, or the worktree is locked): "kept the worktree ap-<s>";
+#   - a file is still in use ("failed to delete"): git has checked there is nothing to commit and
+#     dropped the worktree from its list, but not deleted all of its folder. `end` deletes the
+#     rest. Still in use (by a process that is no build or test tool, such as an editor): "kept
+#     the folder ap-<s>", with the processes that name it, and the file leftover-<s>. The next
+#     `hold` of that slot deletes the folder (or fails, and no helper starts there): a helper's
+#     git in a folder that is no worktree would work in the main checkout. `hold` deletes no other
+#     folder git does not know: it fails.
+# When no other run goes on, `end` also removes the check worktrees (`check-*`, made by
+# ap-check-branch) that a stop or a closed session left; while another runs, they may be its own.
+# `end` also clears the run's stop-in time. Its last line is "other runs: none", or
+# "other runs: <ids>": then the manager leaves the project's shared previews running too.
+#
+# `cleanup` is how the manager runs hooks.cleanup: without --older-than the hook may stop every
+# test run on this computer, also another run's. Its exit code is the hook's (3: the disk is low).
+#
+# A run goes on until its `end`, or until 12 hours after its last `start`, `alive` or `hold`: a
+# manager session that was closed never ends its run. `start` deletes the files of runs not seen
+# for twice that long.
+#
+# The files are in <.git>/ap-autopilot/ (shared by every worktree, lib/run-dir.sh): run-<id> (its
+# mtime: when the run last started a helper), slot-<s> (the id of the run that holds it),
+# issue-<s> (the issue open in ap-<s>, from `hold` until `free`: ap-check's log reads it, to tell
+# a check that ran while the same slot had another issue open), leftover-<s> (the folder an end
+# could not delete all of), stop-<id> (its stop-in time). `hold` and `end` take a lock there, so a
+# slot is never taken over while a run's end removes it.
+set -euo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/run-dir.sh
+source "$LIB/run-dir.sh" # COMMON, MAIN, DIR, LOCK, FRESH_MIN, usage, alive, going_on, locked, stop_file
+# shellcheck source=plugins/ap/lib/run-stop.sh
+source "$LIB/run-stop.sh" # run_stop
+# shellcheck source=plugins/ap/lib/proc-tree.sh
+source "$LIB/proc-tree.sh" # stop_folder_users
+# shellcheck source=plugins/ap/lib/hooks.sh
+source "$LIB/hooks.sh" # hook_cmd, hook_run
+others() { # run id: the other runs that go on
+  local f id
+  for f in "$DIR"/run-*; do
+    [ -f "$f" ] || continue
+    id=${f##*/run-}
+    if [ "$id" != "$1" ] && going_on "$id"; then echo "$id"; fi
+  done
+}
+mine() { # run id: the slots it holds
+  local f
+  for f in "$DIR"/slot-*; do
+    if [ -f "$f" ] && [ "$(cat "$f")" = "$1" ]; then echo "${f##*/slot-}"; fi
+  done
+}
+stop_previews() { # run id, the other runs (words): see the top
+  local s wt cmd
+  if [ -z "$2" ]; then
+    cmd=$(hook_cmd previews_clear) || return 0
+    if [ -z "$cmd" ]; then echo "no hooks.previews_clear in .claude/ap.json: no slot previews to stop"; return 0; fi
+    hook_run "$cmd" "$MAIN" || echo "ap-run: hooks.previews_clear failed" >&2
+    return 0
+  fi
+  [ -n "$(mine "$1")" ] || return 0
+  cmd=$(hook_cmd slot_release) || return 0
+  if [ -z "$cmd" ]; then echo "no hooks.slot_release in .claude/ap.json: no slot previews to stop"; return 0; fi
+  for s in $(mine "$1"); do
+    wt=$MAIN/.claude/worktrees/ap-$s
+    [ -d "$wt" ] || continue
+    hook_run "$cmd" "$wt" || echo "ap-run: could not stop the preview of ap-$s (hooks.slot_release failed)" >&2
+  done
+}
+known() { # folder: git still knows it as a worktree (case aside: Windows paths). Only a folder
+  # git does not know is ever deleted by hand (clear_leftover).
+  local list gd _
+  [ -d "$1/.git" ] && return 0
+  if [ -f "$1/.git" ] && read -r _ gd <"$1/.git" && [ -d "$gd" ]; then return 0; fi
+  # No `| grep -q` (with pipefail, git may fail on the pipe grep closed early).
+  list=$(git -C "$MAIN" worktree list --porcelain) || return 0 # unsure: known
+  [[ $'\n'${list,,}$'\n' == *$'\n'"worktree ${1,,}"$'\n'* ]]
+}
+joined() { paste -sd, - | sed 's/,/, /g'; } # lines as one: "a, b"
+stop_tools() { # folder: stops the build and test tools that still run there (stop_folder_users)
+  # and says which; sets left to the other processes that name it
+  local who stopped
+  who=$(stop_folder_users "$1")
+  stopped=$(sed -n 's/^stopped //p' <<<"$who" | joined) left=$(sed -n 's/^left //p' <<<"$who" | joined)
+  [ -z "$stopped" ] || { echo "stopped what still ran in ${1##*/}: $stopped"; sleep 2; } # Windows lets go of their files
+}
+clear_leftover() { # folder that git began to delete and could not finish (see the top): deletes
+  # it, false when it is still there
+  local _
+  stop_tools "$1"
+  for _ in 1 2 3 4 5; do
+    rm -rf "$1" 2>/dev/null || true
+    [ -e "$1" ] || return 0
+    sleep 1
+  done
+  echo "kept the folder ${1##*/}: git removed the worktree, but a file in it is still in use" \
+    "(${left:+by $left, which is no build or test tool, so it was not stopped}${left:-no process found that names the folder})." >&2
+  return 1
+}
+cleanup() { # the other runs (words), then the hook's arguments: the hook's exit code. An
+  # --older-than of the caller goes through as it is, and is never added a second time.
+  local args=("${@:2}") cmd
+  cmd=$(hook_cmd cleanup) || return
+  if [ -z "$cmd" ]; then echo "no hooks.cleanup in .claude/ap.json: no test runs to clean up"; return 0; fi
+  if [ -n "$1" ] && [[ " ${args[*]} " != *" --older-than "* ]]; then
+    echo "Other runs go on ($1): only what is 90 minutes old is stopped."
+    args+=(--older-than 90)
+  fi
+  hook_run "$cmd" "$MAIN" "${args[@]}"
+}
+slot_name() { [[ $1 =~ ^[0-9]+[b-z]?$ ]]; } # a slot: 2, or 2b for its queue's next worktree
+others_words() { others "$1" | paste -sd' ' -; } # run id: the other runs, on one line
+
+case "${1:-}" in
+  start)
+    [ $# = 1 ] || [ $# = 2 ] && [ "${2:---alone}" = --alone ] || usage
+    if [ $# = 2 ]; then
+      locked "start"
+      rest=$(others "")
+      [ -z "$rest" ] || { echo "$rest"; exit 3; }
+    fi
+    find "$DIR" -name 'run-*' -mmin +$((FRESH_MIN * 2)) -delete
+    id="$(date +%Y%m%d-%H%M%S)-$$"
+    date '+%F %T' >"$DIR/run-$id"
+    echo "$id" ;;
+  alive)
+    [ $# = 2 ] || usage
+    alive "$2" ;;
+  hold)
+    [ $# = 3 ] || [ $# = 4 ] || usage
+    run=$2 s=$3 issue=${4:-}
+    slot_name "$s" || usage
+    case $issue in *[!0-9]*) usage ;; esac
+    alive "$run"
+    locked "hold $run $s"
+    # A folder that an `end` could not delete (see the top): it goes now, or no helper starts here.
+    wt=$MAIN/.claude/worktrees/ap-$s mark=$DIR/leftover-$s
+    if [ -d "$wt" ] && ! known "$wt"; then
+      [ -f "$mark" ] || { echo "ap-run: ap-$s is a folder that git does not know as a worktree, and no end of a run" \
+        "left it: look at what is in it (nothing is deleted). Slot $s not taken." >&2; exit 1; }
+      clear_leftover "$wt" || { echo "slot $s not taken: hold it again once nothing uses the folder" >&2; exit 1; }
+      echo "deleted the folder ap-$s, which an end of a run left (git had removed its worktree)"
+    fi
+    rm -f "$mark"
+    was=$(cat "$DIR/slot-$s" 2>/dev/null || true)
+    if [ -n "$was" ] && [ "$was" != "$run" ] && going_on "$was"; then
+      echo "ap-run: slot $s was held by the run $was, which still goes on: it is this run's now," \
+        "and that run's end leaves it alone. Start a helper there only when no helper of $was works in it." >&2
+    fi
+    printf '%s\n' "$run" >"$DIR/slot-$s"
+    if [ -n "$issue" ]; then echo "$issue" >"$DIR/issue-$s"; else rm -f "$DIR/issue-$s"; fi
+    echo "slot $s: held by the run $run${issue:+, issue #$issue}" ;;
+  free)
+    [ $# = 3 ] || usage
+    run=$2 s=$3
+    slot_name "$s" || usage
+    alive "$run"
+    [ "$(cat "$DIR/slot-$s" 2>/dev/null || true)" = "$run" ] || { echo "ap-run: slot $s is not held by the run $run" >&2; exit 1; }
+    rm -f "$DIR/issue-$s"
+    echo "slot $s: no issue open" ;;
+  others)
+    [ $# = 2 ] || usage
+    others "$2" ;;
+  stop-previews)
+    [ $# = 2 ] || usage
+    stop_previews "$2" "$(others_words "$2")" ;;
+  cleanup)
+    [ $# -ge 2 ] || usage
+    alive "$2"
+    cleanup "$(others_words "$2")" "${@:3}" ;;
+  end)
+    [ $# = 2 ] || usage
+    run=$2
+    locked "end $run"
+    rest=$(others_words "$run")
+    stop_previews "$run" "$rest"
+    dirlock_free "$LOCK" && trap - EXIT
+    # The test runs before the worktrees (see the top). Not under the lock: a cleanup can
+    # take minutes, and a lock held 10 minutes counts as left behind (lib/dirlock.sh).
+    rc=0; cleanup "$rest" || rc=$?
+    locked "end $run"
+    removed=0
+    for s in $(mine "$run"); do
+      wt=$MAIN/.claude/worktrees/ap-$s
+      if [ -d "$wt" ]; then
+        stop_tools "$wt" # also a young test run while another run goes on (the cleanup leaves it)
+        ok=0
+        if why=$(LC_ALL=C git -C "$MAIN" worktree remove "$wt" 2>&1); then ok=1
+        else
+          echo "$why" >&2
+          # git's "failed to delete": a file in use (see the top). Anything else: git refused.
+          if [[ $why != *"failed to delete"* ]] || known "$wt"; then
+            echo "kept the worktree ap-$s: git did not remove it: work not committed, or it is locked (git's words above)" >&2
+          elif clear_leftover "$wt"; then ok=1
+          else
+            : >"$DIR/leftover-$s"
+            echo "  The next \`ap-run hold\` of slot $s deletes it first; no helper may work in it before." >&2
+          fi
+        fi
+        [ $ok = 0 ] || { echo "removed the worktree ap-$s (its branch stays)"; removed=1; }
+      fi
+      rm -f "$DIR/slot-$s" "$DIR/issue-$s"
+    done
+    if [ -z "$rest" ]; then
+      for wt in "$MAIN"/.claude/worktrees/check-*; do
+        [ -d "$wt" ] || continue
+        stop_tools "$wt"
+        git -C "$MAIN" worktree remove --force "$wt" >/dev/null 2>&1 || true
+        git -C "$MAIN" worktree prune
+        if rm -rf "$wt" 2>/dev/null; then echo "removed the check worktree ${wt##*/}, which a check left"
+        else echo "kept the folder ${wt##*/}: a file in it is still in use; the next ap-check-branch of it removes it" >&2
+        fi
+      done
+    fi
+    rm -f "$DIR/run-$run" "$(stop_file "$run")"
+    dirlock_free "$LOCK" && trap - EXIT
+    # Again, for what the worktrees now gone left behind, and the free disk now.
+    if [ $removed = 1 ]; then cleanup "$rest" || rc=$?; fi
+    echo "other runs: ${rest:-none}"
+    exit $rc ;;
+  list)
+    for f in "$DIR"/run-*; do
+      [ -f "$f" ] || continue
+      id=${f##*/run-} slots=$(grep -lx "$id" "$DIR"/slot-* 2>/dev/null | sed 's/.*slot-/ap-/' | tr '\n' ' ' || true)
+      echo "run $id (started $(cat "$f"))$(going_on "$id" || echo ", not seen for $((FRESH_MIN / 60)) hours"): ${slots:-no slot}"
+    done ;;
+  stop-in | stop-left | stop-wait | stop-clear)
+    run_stop "$@" ;;
+  *) usage ;;
+esac

@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# What goes on now, in one short report: the runs that go on and their slots, the open pull
+# requests, the open issues in groups, and what was opened and solved since the run started. It
+# only reads: no comment, no label, no file of the project changes.
+#
+#   ap-status [--json] [--since <date>] [--label <l>[,<l>...]]... [--not <l>]... [--max <n>]
+#
+#   --json    the report as JSON (for /ap:status); without it, plain text
+#   --since   the start of "opened and solved" (a GitHub date: 2026-11-02 or 2026-11-02T10:00:00+02:00);
+#             default: the start of the oldest run that goes on, or else 24 hours ago
+#   --label   a run's label limit, as ap-list takes it: "ready" keeps only the issues with every
+#             --label (a,b: either one), and every P0; the approved look-back issues come first
+#   --not     the same: "ready" leaves out the issues with that label
+#   --max     the lines each group shows (default 5); the rest is counted as "and N more"
+#
+# Each list comes from one `gh` call (open issues, the blocked ones with their comments, the
+# [retro] ones with their comments, open pull requests, run issues, issues opened, closed, pull
+# requests merged since), never one per issue. A
+# list that fails is named in the report ("Could not read"), and the rest still shows.
+# The runs, slots and stops are the files of ap-run (lib/run-dir.sh). lib/status.py builds the
+# report from what this script gathers, with lib/issues.py, which ap-list shares: "ready" is the
+# list a run would take, but for the stopped issues (under "in progress"). Exit 0: a report; 2: it
+# could not run.
+set -euo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/config.sh
+source "$LIB/config.sh" # ap_config, ap_python
+# shellcheck source=plugins/ap/lib/run-dir.sh
+source "$LIB/run-dir.sh" # MAIN, DIR, going_on, stop_file, remote_branches
+# shellcheck source=plugins/ap/lib/run-stop.sh
+source "$LIB/run-stop.sh" # stop_left
+
+usage() { echo "usage: ap-status [--json] [--since <date>] [--label <l>[,<l>...]]... [--not <l>]... [--max <n>]" >&2; exit 2; }
+report_args=() since=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --json) report_args+=(--json) ;;
+    --since) [ $# -ge 2 ] && [ -n "$2" ] || usage; since=$2; shift ;;
+    --label | --not) [ $# -ge 2 ] && [ -n "$2" ] || usage; report_args+=("$1" "$2"); shift ;;
+    --max) [[ ${2:-} =~ ^[0-9]+$ ]] || usage; report_args+=(--max "$2"); shift ;;
+    *) usage ;;
+  esac
+  shift
+done
+
+for key in repo owner main_branch; do
+  rc=0; ap_config "$key" >/dev/null || rc=$?
+  [ $rc = 0 ] || { [ $rc = 2 ] || echo "ap-status: .claude/ap.json has no $key: run /ap:setup first" >&2; exit 2; }
+done
+repo=$(ap_config repo)
+
+FACTS=$(mktemp)
+trap 'kill $(jobs -p) 2>/dev/null || true; rm -f "$FACTS" "$FACTS".*' EXIT
+trap 'exit 130' INT TERM HUP
+part() { printf '@@ %s\n' "$1"; } # the start of one part of the facts (lib/status.py)
+# The facts of one file or worktree never end the report: what cannot be read is `?` (or now).
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo "$EPOCHSECONDS"; } # file: its time
+first_line() { head -1 "$1" 2>/dev/null || echo '?'; } # file: its first line
+dirty() { # worktree: how many files have changes not committed (no index lock: it only reads)
+  local out
+  out=$(git -C "$1" --no-optional-locks status --porcelain 2>/dev/null) || { echo '?'; return 0; }
+  [ -n "$out" ] && wc -l <<<"$out" | tr -d ' ' || echo 0
+}
+with_colon() { sed -E 's/([+-][0-9]{2})([0-9]{2})$/\1:\2/'; } # +0200 -> +02:00, as GitHub reads it
+GH=() # the parts gh_part started, in their order
+gh_part() { # name, gh args...: starts one gh list in the background, as a part of the facts
+  # (gh_parts adds them); when gh fails, an error part. Each gh call takes a second or more, so
+  # they all run at once.
+  GH+=("$1")
+  { if gh "${@:2}" >"$FACTS.$1.out" 2>"$FACTS.$1.err"; then
+      { part "$1"; cat "$FACTS.$1.out"; echo; } >"$FACTS.$1"
+    else
+      { part error; echo "$1: $(head -1 "$FACTS.$1.err")"; } >"$FACTS.$1"
+    fi
+    rm -f "$FACTS.$1.out" "$FACTS.$1.err"; } &
+}
+gh_parts() { # waits for the parts gh_part started and prints them, in their order
+  local n
+  wait
+  for n in "${GH[@]}"; do cat "$FACTS.$n"; rm -f "$FACTS.$n"; done
+}
+
+{
+  part now; echo "$EPOCHSECONDS"
+  part config; cat "$MAIN/.claude/ap.json"; echo
+
+  part run
+  oldest=
+  for f in "$DIR"/run-*; do
+    [ -f "$f" ] || continue
+    id=${f##*/run-} started=$(first_line "$f") going=0
+    if going_on "$id"; then
+      going=1
+      [ -n "$oldest" ] && [[ $started > $oldest ]] || oldest=$started
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$started" "$(mtime "$f")" "$going" "$(stop_left "$id")"
+  done
+  part slot
+  for f in "$DIR"/slot-*; do
+    [ -f "$f" ] || continue
+    s=${f##*/slot-} wt=$MAIN/.claude/worktrees/ap-${f##*/slot-} there=0 branch= changes=0
+    if [ -d "$wt" ]; then
+      there=1 branch=$(git -C "$wt" branch --show-current 2>/dev/null || true) changes=$(dirty "$wt")
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$s" "$(first_line "$f")" "$(mtime "$f")" "$there" "$branch" "$changes"
+  done
+  part main
+  printf '%s\t%s\n' "$(git -C "$MAIN" branch --show-current 2>/dev/null || true)" "$(dirty "$MAIN")"
+  part branches; remote_branches
+
+  if [ -z "$since" ]; then
+    if [ -n "$oldest" ]; then since="${oldest/ /T}$(date +%z | with_colon)"
+    else since=$(printf '%(%Y-%m-%dT%H:%M:%S%z)T' $((EPOCHSECONDS - 86400)) | with_colon)
+    fi
+  fi
+  part since; echo "$since"
+
+  gh_part issues issue list --repo "$repo" --state open --limit 500 --json number,title,labels
+  gh_part blocked issue list --repo "$repo" --state open --label status:blocked --limit 100 \
+    --json number,body,comments
+  gh_part lookback issue list --repo "$repo" --state open --search "[retro] in:title" --limit 50 \
+    --json number,comments
+  gh_part prs pr list --repo "$repo" --state open --limit 100 \
+    --json number,title,headRefName,isDraft,reviewDecision,mergeable
+  if [ -n "$oldest" ]; then
+    gh_part run_issues issue list --repo "$repo" --state open --label tracking \
+      --search "[autopilot] in:title" --limit 10 --json number,title,url,body,comments
+  fi
+  gh_part opened issue list --repo "$repo" --state all --search "created:>=$since" --limit 200 \
+    --json number
+  gh_part closed issue list --repo "$repo" --state closed --search "closed:>=$since" --limit 200 \
+    --json number,title,labels,stateReason,closedByPullRequestsReferences
+  gh_part merged pr list --repo "$repo" --state merged --search "merged:>=$since" --limit 100 \
+    --json number,headRefName,body
+  gh_parts
+} >"$FACTS"
+
+ap_python "$(<"$LIB/issues.py")"$'\n'"$(<"$LIB/status.py")" "$FACTS" "${report_args[@]}"

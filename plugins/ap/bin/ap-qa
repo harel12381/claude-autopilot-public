@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# The /ap:qa sweep: the project's own cases (qa.cases in .claude/ap.json, docs/qa.md of the
+# plugin), run on its site with Playwright at phone size, in Chromium and WebKit, in the
+# project's languages and themes. It saves a picture of what each case shows, and the contact
+# sheet <out>/index.html; its last lines say how many checks failed or were not judged.
+#
+#   ap-qa [--url <site>] [--browsers chromium,webkit] [--langs en,he] [--themes light,dark]
+#         [--only <case>,<case>] [--device "iPhone 13"] [--out <folder>] [--deploy-wait <minutes>]
+#         [--busy-load <percent>]
+#
+# The settings: the checkout's own .claude/ap.json (a branch is checked with the cases it has), or
+# the main checkout's when it has none. The cases folder is relative to the checkout it runs in.
+# Before the sweep, and before each case, it waits while ap-deploy holds the deploy lock; a check
+# that failed beside a deploy is not judged. A lock whose ap-deploy is gone is removed first.
+#
+# Exit codes: 0 every check passed (a check not judged passes, and is named at the end), 1 a check
+# failed, 2 it could not run (no Python with Playwright, no cases, no site, a deploy that did not
+# end), 3 the part is off (parts.qa is not true).
+set -uo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/config.sh
+source "$LIB/config.sh" || exit 2
+# shellcheck source=plugins/ap/lib/dirlock.sh
+source "$LIB/dirlock.sh"
+
+case ${1:-} in -h | --help) sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;; esac
+
+MAIN=$(ap_main) || exit 2
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "ap-qa: $PWD is not inside a git checkout" >&2; exit 2; }
+COMMON=$(git rev-parse --path-format=absolute --git-common-dir) || exit 2
+SETTINGS=$(ap_config_file "$ROOT") || exit 2
+[ -f "$SETTINGS" ] || { echo "ap-qa: there is no .claude/ap.json: run /ap:setup first" >&2; exit 2; }
+
+rc=0; on=$(ap_read "$SETTINGS" parts.qa) || rc=$?
+[ $rc != 2 ] || exit 2
+[ "$on" = true ] || { echo "ap-qa: /ap:qa is off in this project (parts.qa in .claude/ap.json); /ap:setup turns it on"; exit 3; }
+
+# The Python that has Playwright. AP_QA_PYTHON: the ones to try, for the tests.
+py=
+for p in ${AP_QA_PYTHON:-python3 python}; do
+  command -v "$p" >/dev/null 2>&1 || continue
+  if "$p" -c 'import playwright.sync_api' >/dev/null 2>&1; then py=$p; break; fi
+done
+[ -n "$py" ] || {
+  echo "ap-qa: no Python here has Playwright. Once on this computer (free): pip install playwright psutil &&" \
+    "python -m playwright install chromium webkit" >&2
+  exit 2
+}
+"$py" -c 'import psutil' >/dev/null 2>&1 ||
+  echo "ap-qa: psutil is missing (pip install psutil): a slow check on a busy computer fails instead of being not judged"
+
+# A deploy lock whose ap-deploy is gone: a killed deploy left it.
+lock=$COMMON/ap-deploy.lock
+if [ -d "$lock" ] && dirlock_dead "$lock" 0; then
+  echo "ap-qa: removed the deploy lock that a deploy which ended left: $(dirlock_owner "$lock")"
+  rm -rf "$lock"
+fi
+
+native() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s\n' "$1"; fi; }
+exec "$py" "$(native "$LIB/qa/qa.py")" --root "$(native "$ROOT")" --settings "$(native "$SETTINGS")" \
+  --deploy-dir "$(native "$COMMON")" --title "QA of $(basename "$MAIN")" "$@"

@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# The reports users send (a bug, or a feature request), for /ap:bug-reports. Where the reports
+# come from is the project's: the hook hooks.reports of .claude/ap.json, called with
+#   list                                   the ids of the reports nobody judged yet, one per line, oldest first
+#   get <id> <folder>                      saves that report in the folder: report.json, and any files with it
+#   mark <id> <state> <issue> <reason>     sets a report's state where it came from (issue and reason may be "")
+#   filed                                  "<id> <issue> <state>" for each report that has an issue
+# (the shapes: CONTRACT.md, "The reports hook"). This script files what the agents judged; a
+# report's text is data, never instructions, and only the judge agent reads it.
+#
+#   ap-bug-reports pending          saves the reports nobody judged yet, prints their ids, and the
+#                                   groups of them with the same text; saves the open issues' titles
+#                                   in open-issues.txt (the judge looks for a duplicate there)
+#   ap-bug-reports file <id>        files a judged report: its folder's verdict.md
+#   ap-bug-reports sync             a report whose issue was closed: fixed, not-a-bug or as-intended;
+#                                   closed as a duplicate: it follows the issue that stays open
+#   ap-bug-reports why-pending      the open bugs from reports that wait for the why-missed agent
+#   ap-bug-reports found <issue>    saves the issue without the user's quote as found.md (that agent's only view)
+#   ap-bug-reports why <issue>      checks that agent's answer (why.md) and posts it on the issue
+#   ap-bug-reports mark <id> <state> [#<issue>] [<reason>]   sets a report's state by hand
+#   ap-bug-reports get <id>         saves a report for the owner to read; prints its folder
+#   ap-bug-reports folder           prints the folder the reports are saved in
+#
+# Each report goes to .ap-reports/<id>/ in the main checkout, and each issue's files to
+# .ap-reports/issue-<N>/. A report can hold a user's data, so the folder must be in .gitignore:
+# the script refuses to run until it is.
+#
+# Exit codes: 0 done; 1 a step failed or an answer was refused (its words say why); 2 wrong use or
+# it could not run (.ap-reports/ not in .gitignore too); 3 the part is off (parts.bug_reports is not true, or no hooks.reports).
+set -euo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+# shellcheck source=plugins/ap/lib/require.sh
+source "$LIB/require.sh"
+# shellcheck source=plugins/ap/lib/hooks.sh
+source "$LIB/hooks.sh" # ap_config, hook_cmd, hook_run
+
+usage() { sed -n '/^#   ap-bug-reports/p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+setting() { # key [default]: prints it; the settings cannot be read: the script ends
+  local v rc=0
+  v=$(ap_config "$@") || rc=$?
+  [ $rc != 2 ] || exit 2
+  printf '%s\n' "$v"
+  return $rc
+}
+
+[ $# -ge 1 ] || usage
+MAIN=$(ap_main) || exit 2
+OUT=$MAIN/.ap-reports
+on=$(setting parts.bug_reports false)
+HOOK=$(hook_cmd reports) || exit 2
+if [ "$on" != true ] || [ -z "$HOOK" ]; then
+  echo "ap-bug-reports: /ap:bug-reports is off in this project (parts.bug_reports and hooks.reports in .claude/ap.json); /ap:setup turns it on"
+  exit 3
+fi
+git -C "$MAIN" check-ignore -q .ap-reports/ || {
+  echo "ap-bug-reports: .ap-reports/ is not in .gitignore: add it (/ap:setup does), so no user's report is ever committed" >&2
+  exit 2
+}
+repo=$(setting repo) || { echo "ap-bug-reports: .claude/ap.json has no repo: run /ap:setup first" >&2; exit 2; }
+owner=$(setting owner "the owner")
+trusted=$(setting bug_reports.trusted false)
+board_number=$(setting board.number "") board_owner=$(setting board.owner "")
+
+PY=
+for p in python3 python; do
+  if command -v "$p" >/dev/null 2>&1 && "$p" -c 'import sys' >/dev/null 2>&1; then PY=$p; break; fi
+done
+[ -n "$PY" ] || { echo "ap-bug-reports: needs Python 3 (python3 or python), and neither runs here" >&2; exit 2; }
+native() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s\n' "$1"; fi; }
+py() { PYTHONIOENCODING=utf-8 "$PY" -I "$(native "$LIB/bug_reports.py")" "$@"; }
+gh_() { gh "$@" --repo "$repo"; }
+reports() { hook_run "$HOOK" "$MAIN" "$@"; }
+# The .env whose values never go into an issue: the main checkout's.
+ENV=$MAIN/.env
+
+report_id() { [[ $1 =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "ap-bug-reports: not a report id: $1" >&2; exit 2; }; }
+issue_number() { # "#N" or "N": prints N; anything else ends the script
+  local n=${1#\#}
+  [[ $n =~ ^[0-9]+$ ]] || { echo "ap-bug-reports: not an issue number: $1" >&2; exit 2; }
+  echo "$n"
+}
+new_ids() { # the ids the hook lists, checked
+  local ids id
+  ids=$(reports list) || { echo "ap-bug-reports: the reports hook could not list the reports" >&2; exit 1; }
+  for id in $ids; do report_id "$id"; echo "$id"; done
+}
+mark() { # id, state, [issue], [reason]
+  local reason=${4:-}
+  reports mark "$1" "$2" "${3:-}" "${reason:0:200}" ||
+    { echo "ap-bug-reports: the reports hook could not mark report $1 $2" >&2; return 1; }
+  echo "Report $1: $2${3:+ (#$3)}"
+}
+on_board() { # url
+  [ -n "$board_number" ] || return 0
+  gh project item-add "$board_number" --owner "$board_owner" --url "$1" >/dev/null || echo "Not on the board: $1" >&2
+}
+area_labels() { # the repository's area labels, without "area:", by commas
+  gh label list --repo "$repo" --limit 200 --json name --jq '[.[].name | select(startswith("area:")) | ltrimstr("area:")] | join(",")'
+}
+
+# Each user-report issue as "<number> <the state its report gets>": closed with the label
+# not-a-bug or as-intended, that; closed as done, fixed; closed as a duplicate, "duplicate";
+# open with status:triage, copied; open, bug (or feature); closed in another way, "-".
+ISSUE_STATES='.[] | [.labels[].name] as $l | "\(.number) \(if .state == "CLOSED" then
+    (if ($l | index("not-a-bug")) then "not-a-bug" elif ($l | index("as-intended")) then "as-intended"
+     elif .stateReason == "COMPLETED" then "fixed" elif .stateReason == "DUPLICATE" then "duplicate"
+     else "-" end)
+  elif ($l | index("status:triage")) then "copied" elif ($l | index("type:feature")) then "feature" else "bug" end)"'
+# The issue that <issue> was closed as a duplicate of; nothing when GitHub does not say or it is in
+# another repository. Only GraphQL has it.
+DUPLICATE_OF='query($owner: String!, $name: String!, $n: Int!) { repository(owner: $owner, name: $name) {
+  nameWithOwner issue(number: $n) { timelineItems(itemTypes: [CLOSED_EVENT], last: 1) {
+    nodes { ... on ClosedEvent { duplicateOf { ... on Issue { number repository { nameWithOwner } } } } } } } } }'
+duplicate_of() {
+  gh api graphql -f query="$DUPLICATE_OF" -F owner="${repo%%/*}" -F name="${repo#*/}" -F n="$1" \
+    --jq '.data.repository as $r | $r.issue.timelineItems.nodes[0].duplicateOf // empty
+      | select(.repository.nameWithOwner == $r.nameWithOwner) | .number'
+}
+follow_issue() { # issue: gives it the user-report label, so the next sync lists it; prints its state
+  gh_ issue edit "$1" --add-label user-report >/dev/null &&
+    gh_ issue view "$1" --json number,state,stateReason,labels --jq "[.] | $ISSUE_STATES" | cut -d' ' -f2
+}
+
+case $1 in
+  folder)
+    echo "$OUT"
+    ;;
+  pending)
+    [ $# = 1 ] || usage
+    ids=$(new_ids)
+    mkdir -p "$OUT"
+    gh_ issue list --state open --limit 1000 --json number,title --jq '.[] | "#\(.number) \(.title)"' >"$OUT/open-issues.txt" ||
+      { echo "ap-bug-reports: gh could not list the open issues" >&2; exit 1; }
+    for id in $ids; do
+      # Only those not saved here yet: their files can be megabytes.
+      [ -s "$OUT/$id/report.json" ] && continue
+      mkdir -p "$OUT/$id"
+      reports get "$id" "$(native "$OUT/$id")" || { echo "ap-bug-reports: the reports hook could not get report $id" >&2; exit 1; }
+      [ -s "$OUT/$id/report.json" ] || { echo "ap-bug-reports: the reports hook saved no report.json for report $id" >&2; exit 1; }
+    done
+    line=$(paste -sd' ' - <<<"$ids")
+    echo "Not judged yet: ${line:-none}"
+    if [ -n "$ids" ]; then
+      folders=(); for id in $ids; do folders+=("$(native "$OUT/$id")"); done
+      py same-text "${folders[@]}" | sed 's/^/Same text: /'
+    fi
+    ;;
+  file)
+    [ $# = 2 ] || usage
+    id=$2; report_id "$id"
+    dir=$OUT/$id
+    # Never twice: only a report that is still new where it came from.
+    grep -qxF "$id" <<<"$(new_ids)" || { echo "ap-bug-reports: report $id is not new: not filed again" >&2; exit 1; }
+    [ -s "$dir/verdict.md" ] || { echo "ap-bug-reports: no verdict in $dir/verdict.md" >&2; exit 1; }
+    areas=$(area_labels) || { echo "ap-bug-reports: gh could not list the labels" >&2; exit 1; }
+    verdict=$(py prepare "$(native "$dir")" "$areas" "$trusted" "$(native "$ENV")")
+    kind=$(sed -n 1p <<<"$verdict")
+    case $kind in
+      bug | unsure | feature)
+        # Each step is kept in the folder once it is done (issue-url, comment-posted): a run that
+        # stopped before the mark below does only the steps left, and opens no second issue.
+        if [ -s "$dir/issue-url" ]; then
+          url=$(cat "$dir/issue-url")
+        else
+          url=$(gh_ issue create --title "$(cat "$dir/issue-title.txt")" --label "$(cat "$dir/issue-labels.txt")" \
+            --body-file "$dir/issue-body.md")
+          printf '%s\n' "$url" >"$dir/issue-url"
+        fi
+        num=${url##*/}
+        [[ $num =~ ^[0-9]+$ ]] || { echo "ap-bug-reports: gh issue create gave no issue: $url" >&2; exit 1; }
+        if [ "$kind" = feature ] && [ "$trusted" != true ] && [ ! -e "$dir/comment-posted" ]; then
+          printf '**Waiting for %s.** A user asked for this. Build it (yes), not (no), or change it?\n' "$owner" >"$dir/comment.md"
+          gh_ issue comment "$num" --body-file "$dir/comment.md" >/dev/null
+          echo "$num" >"$dir/comment-posted"
+        fi
+        case $kind in bug) state=bug ;; feature) state=feature ;; *) state=copied ;; esac
+        mark "$id" "$state" "$num" >/dev/null || {
+          echo "ap-bug-reports: issue $url is filed, but report $id is not marked. Run: ap-bug-reports mark $id $state #$num" >&2
+          exit 1
+        }
+        on_board "$url"
+        echo "$url"
+        ;;
+      duplicate)
+        num=$(sed -n 3p <<<"$verdict")
+        facts=$(gh_ issue view "$num" --json state,labels --jq '.state, ([.labels[].name] | join(","))') ||
+          { echo "ap-bug-reports: gh could not read issue #$num" >&2; exit 1; }
+        open=$(sed -n 1p <<<"$facts") labels=$(sed -n 2p <<<"$facts")
+        [ "$open" = OPEN ] || { echo "ap-bug-reports: the verdict names issue #$num, which is not open: answer with an open issue, or file it" >&2; exit 1; }
+        # Once only, also when a run stopped before the mark below.
+        if [ "$(cat "$dir/again-posted" 2>/dev/null)" != "$num" ]; then
+          gh_ issue comment "$num" --body-file "$dir/comment.md" >/dev/null
+          echo "$num" >"$dir/again-posted"
+        fi
+        gh_ issue edit "$num" --add-label user-report >/dev/null
+        if [[ ,$labels, == *,type:feature,* ]]; then state=feature; else state=bug; fi
+        mark "$id" "$state" "$num" >/dev/null
+        echo "report $id: asked again on #$num"
+        ;;
+      *)
+        reason=$(sed -n 2p <<<"$verdict")
+        mark "$id" "$kind" "" "$reason" >/dev/null
+        # The line for the run issue: the agent's reason, never the report's text.
+        echo "report $id not filed: $kind, $reason"
+        ;;
+    esac
+    ;;
+  why-pending)
+    [ $# = 1 ] || usage
+    json=$(gh_ issue list --label user-report --state open --limit 200 --json number,state,labels,body,comments)
+    pending=$(py why-pending <<<"$json")
+    echo "Waiting for the why-missed agent: ${pending:-none}"
+    ;;
+  found)
+    [ $# = 2 ] || usage
+    issue=$(issue_number "$2")
+    json=$(gh_ issue view "$issue" --json number,title,labels,body)
+    dir=$OUT/issue-$issue
+    mkdir -p "$dir"
+    py found <<<"$json" >"$dir/found.md"
+    echo "$dir/found.md"
+    ;;
+  why)
+    [ $# = 2 ] || usage
+    issue=$(issue_number "$2")
+    json=$(gh_ issue view "$issue" --json number,state,labels,body,comments)
+    dir=$OUT/issue-$issue
+    found_it=$(py why "$(native "$dir")" "$(native "$ENV")" <<<"$json")
+    gh_ issue comment "$issue" --body-file "$dir/comment.md" >/dev/null
+    if [ "$found_it" = yes ]; then
+      echo "#$issue: why-missed comment posted"
+    else
+      gh_ issue edit "$issue" --add-label status:triage >/dev/null
+      echo "#$issue: the agent did not find the bug in the code: comment posted, status:triage"
+    fi
+    ;;
+  mark)
+    [ $# -ge 3 ] && [ $# -le 5 ] || usage
+    report_id "$2"
+    [[ $3 =~ ^[a-z-]+$ ]] || { echo "ap-bug-reports: not a state: $3" >&2; exit 2; }
+    issue=; [ -z "${4:-}" ] || issue=$(issue_number "$4")
+    mark "$2" "$3" "$issue" "${5:-}"
+    ;;
+  get)
+    [ $# = 2 ] || usage
+    report_id "$2"
+    mkdir -p "$OUT/$2"
+    reports get "$2" "$(native "$OUT/$2")" || { echo "ap-bug-reports: the reports hook could not get report $2" >&2; exit 1; }
+    echo "$OUT/$2"
+    ;;
+  sync)
+    [ $# = 1 ] || usage
+    declare -A issue_state=() duplicate=() seen=()
+    states=$(gh_ issue list --state all --label user-report --limit 1000 --json number,state,stateReason,labels --jq "$ISSUE_STATES")
+    while read -r num state; do [ -z "$num" ] || issue_state[$num]=$state; done <<<"$states"
+    filed=$(reports filed) || { echo "ap-bug-reports: the reports hook could not list the filed reports" >&2; exit 1; }
+    while read -r id issue state; do
+      [ -n "$id" ] || continue
+      report_id "$id"; issue=$(issue_number "$issue")
+      now=${issue_state[$issue]:-} from=$issue seen=()
+      # A duplicate: the report follows the issue it duplicates, and that one's in turn, up to one
+      # that is not a duplicate. A GitHub call that fails leaves the report as it is.
+      while [ "$now" = duplicate ] && [ -z "${seen[$issue]:-}" ]; do
+        seen[$issue]=1
+        [ -n "${duplicate[$issue]+set}" ] || duplicate[$issue]=$(duplicate_of "$issue") || duplicate[$issue]=
+        other=${duplicate[$issue]}
+        [[ $other =~ ^[0-9]+$ ]] || break
+        [ -n "${issue_state[$other]:-}" ] || issue_state[$other]=$(follow_issue "$other") || break
+        issue=$other now=${issue_state[$other]}
+      done
+      if [ "$now" = duplicate ]; then
+        echo "Report $id: issue #$issue was closed as a duplicate, but sync found no other issue to follow: left $state"
+      elif [ -z "$now" ]; then
+        echo "Report $id: issue #$issue has no user-report label: left $state"
+      elif [ "$now" = - ]; then
+        echo "Report $id: issue #$issue was closed, but not as done nor with not-a-bug or as-intended: left $state"
+      elif [ "$now" != "$state" ] || [ "$issue" != "$from" ]; then
+        reason=
+        case $now in not-a-bug | as-intended) reason="see issue #$issue" ;; esac
+        mark "$id" "$now" "$issue" "$reason"
+      fi
+    done <<<"$filed"
+    ;;
+  *) usage ;;
+esac

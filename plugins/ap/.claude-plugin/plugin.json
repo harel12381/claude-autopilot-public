@@ -1,0 +1,7 @@
+{
+  "name": "ap",
+  "version": "0.5.0",
+  "description": "Autopilot runs and the issue workflow for a GitHub project.",
+  "author": { "name": "harel12381" },
+  "repository": "https://github.com/harel12381/claude-autopilot-public"
+}

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# The plugin's PreToolUse hook for the Bash tool (hooks/hooks.json): it refuses a background
+# command that starts a long program (a dev server, `python`, `go run`) without ap-background,
+# and says to add the prefix. Stopping a background task ends only its shell on Windows, so a
+# program started without ap-background keeps running after the task is stopped.
+#
+#   ap-background-hook < hook-input.json
+#
+# The decision is lib/background-hook.py (which commands, `background_wrap` in .claude/ap.json).
+# Exit 0: the command runs; 2: it is refused, and the words on stderr go back to the agent. When
+# no Python runs, or the input cannot be read, the command runs: the hook never stops work.
+set -uo pipefail
+LIB=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib
+input=$(cat) || exit 0
+# Most Bash commands run in the foreground: those need no Python at all.
+[[ $input =~ \"run_in_background\"[[:space:]]*:[[:space:]]*true ]] || exit 0
+code=$(<"$LIB/background-hook.py") || exit 0
+for p in python3 python; do
+  command -v "$p" >/dev/null 2>&1 || continue
+  rc=0
+  out=$("$p" -I -c "$code" <<<"$input" 2>/dev/null) || rc=$?
+  case $rc in
+    10) exit 0 ;;
+    12) printf '%s\n' "$out" >&2; exit 2 ;;
+  esac
+done
+exit 0
